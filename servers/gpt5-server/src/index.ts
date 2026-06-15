@@ -4,6 +4,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
   ErrorCode,
   McpError
 } from "@modelcontextprotocol/sdk/types.js";
@@ -12,7 +14,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
-import { callGPT5, callGPT5WithMessages } from './utils.js';
+import { callGPT5, callGPT5WithMessages, generateImage } from './utils.js';
 
 // Initialize environment from parent directory
 import { dirname } from 'path';
@@ -25,7 +27,7 @@ console.error("Environment loaded from:", envPath);
 // Schema definitions
 const GPT5GenerateSchema = z.object({
   input: z.string().describe("The input text or prompt for GPT-5"),
-  model: z.string().optional().default("gpt-5").describe("GPT-5 model variant to use"),
+  model: z.string().optional().default("gpt-5.5").describe("GPT-5 model variant to use (via Codex CLI)"),
   instructions: z.string().optional().describe("System instructions for the model"),
   reasoning_effort: z.enum(['low', 'medium', 'high']).optional().describe("Reasoning effort level"),
   max_tokens: z.number().optional().describe("Maximum tokens to generate"),
@@ -38,7 +40,7 @@ const GPT5MessagesSchema = z.object({
     role: z.enum(['user', 'developer', 'assistant']).describe("Message role"),
     content: z.string().describe("Message content")
   })).describe("Array of conversation messages"),
-  model: z.string().optional().default("gpt-5").describe("GPT-5 model variant to use"),
+  model: z.string().optional().default("gpt-5.5").describe("GPT-5 model variant to use (via Codex CLI)"),
   instructions: z.string().optional().describe("System instructions for the model"),
   reasoning_effort: z.enum(['low', 'medium', 'high']).optional().describe("Reasoning effort level"),
   max_tokens: z.number().optional().describe("Maximum tokens to generate"),
@@ -47,18 +49,44 @@ const GPT5MessagesSchema = z.object({
 });
 
 
+const GPT5ImageSchema = z.object({
+  scene: z.string().describe("Detailed scene description for the image to generate"),
+  out_path: z.string().describe("Absolute path where the PNG should be saved (e.g. /Users/greg/out/shot.png)"),
+  aspect: z.enum(['9:16', '16:9', '1:1']).optional().default('9:16').describe("Aspect ratio")
+});
+
+
 // Type definitions
 type GPT5GenerateArgs = z.infer<typeof GPT5GenerateSchema>;
+type GPT5ImageArgs = z.infer<typeof GPT5ImageSchema>;
 type GPT5MessagesArgs = z.infer<typeof GPT5MessagesSchema>;
+
+// Usage doc exposed as an MCP resource so connecting clients can fetch a
+// human-readable README through the protocol (in addition to tools/list, which
+// already exposes every tool's param schema).
+const README = `# gpt5-server (MCP)
+
+Drives the **Codex CLI** (ChatGPT OAuth) — no OPENAI_API_KEY, no credits.
+Run \`codex login\` once if not authenticated. Defaults to model **gpt-5.5**.
+
+## Tools
+- **gpt5_generate** { input, model?=gpt-5.5, instructions?, reasoning_effort?, max_tokens?, temperature?, top_p? }
+  → text. Single-prompt generation via \`codex exec\`.
+- **gpt5_messages** { messages:[{role,content}], model?=gpt-5.5, instructions?, reasoning_effort?, ... }
+  → text. Multi-turn transcript rendered into one Codex prompt.
+- **gpt5_image** { scene, out_path (absolute), aspect?=9:16|16:9|1:1 }
+  → saves a PNG to out_path FOR FREE (Codex built-in image tool / gpt-image). Returns the saved path.
+
+## Notes
+- Image gen is agentic (the model writes the file); allow up to ~4 min.
+- API-only model snapshots are irrelevant here — the CLI session picks the backing model.
+- Full machine-readable param schemas: call \`tools/list\`.
+`;
 
 // Main function
 async function main() {
-  // Check if OPENAI_API_KEY is set
-  if (!process.env.OPENAI_API_KEY) {
-    console.error('Error: OPENAI_API_KEY environment variable is not set');
-    console.error('Please set it in .env file or as an environment variable');
-    process.exit(1);
-  }
+  // No OPENAI_API_KEY needed — this server drives the Codex CLI, which uses the
+  // logged-in ChatGPT account. (Run `codex login` once if not authenticated.)
 
   // Create MCP server
   const server = new Server({
@@ -66,7 +94,8 @@ async function main() {
     version: "0.1.0"
   }, {
     capabilities: {
-      tools: {}
+      tools: {},
+      resources: {}
     }
   });
 
@@ -80,6 +109,29 @@ async function main() {
     process.exit(0);
   });
 
+  // Resource handlers — expose the usage README at usage://readme
+  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: [
+      {
+        uri: "usage://readme",
+        name: "gpt5-server usage",
+        description: "How to use this server's tools (Codex CLI / ChatGPT OAuth)",
+        mimeType: "text/markdown",
+      },
+    ],
+  }));
+
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    if (request.params.uri === "usage://readme") {
+      return {
+        contents: [
+          { uri: "usage://readme", mimeType: "text/markdown", text: README },
+        ],
+      };
+    }
+    throw new McpError(ErrorCode.InvalidParams, `Unknown resource: ${request.params.uri}`);
+  });
+
   // Set up tool handlers
   server.setRequestHandler(
     ListToolsRequestSchema,
@@ -89,13 +141,18 @@ async function main() {
         tools: [
           {
             name: "gpt5_generate",
-            description: "Generate text using OpenAI GPT-5 API with a simple input prompt",
+            description: "Generate text using GPT-5 (gpt-5.5 via the Codex CLI / ChatGPT auth) from a simple input prompt",
             inputSchema: zodToJsonSchema(GPT5GenerateSchema),
           },
           {
             name: "gpt5_messages",
             description: "Generate text using GPT-5 with structured conversation messages",
             inputSchema: zodToJsonSchema(GPT5MessagesSchema),
+          },
+          {
+            name: "gpt5_image",
+            description: "Generate an image FOR FREE via the Codex CLI's built-in image tool (ChatGPT OAuth / gpt-image — no API key, no credits). Saves a PNG to out_path.",
+            inputSchema: zodToJsonSchema(GPT5ImageSchema),
           },
         ]
       };
@@ -113,7 +170,7 @@ async function main() {
             const args = GPT5GenerateSchema.parse(request.params.arguments) as GPT5GenerateArgs;
             console.error(`GPT-5 Generate: "${args.input.substring(0, 100)}..."`);
             
-            const result = await callGPT5(process.env.OPENAI_API_KEY!, args.input, {
+            const result = await callGPT5(undefined, args.input, {
               model: args.model,
               instructions: args.instructions,
               reasoning_effort: args.reasoning_effort,
@@ -139,7 +196,7 @@ async function main() {
             const args = GPT5MessagesSchema.parse(request.params.arguments) as GPT5MessagesArgs;
             console.error(`GPT-5 Messages: ${args.messages.length} messages`);
             
-            const result = await callGPT5WithMessages(process.env.OPENAI_API_KEY!, args.messages, {
+            const result = await callGPT5WithMessages(undefined, args.messages, {
               model: args.model,
               instructions: args.instructions,
               reasoning_effort: args.reasoning_effort,
@@ -160,7 +217,19 @@ async function main() {
               }]
             };
           }
-          
+
+          case "gpt5_image": {
+            const args = GPT5ImageSchema.parse(request.params.arguments) as GPT5ImageArgs;
+            console.error(`GPT-5 Image: -> ${args.out_path} (${args.aspect})`);
+
+            const result = await generateImage(args.scene, args.out_path, args.aspect);
+
+            return {
+              content: [{ type: "text", text: result.content }],
+              ...(result.error ? { isError: true } : {})
+            };
+          }
+
           default:
             throw new McpError(
               ErrorCode.MethodNotFound,
