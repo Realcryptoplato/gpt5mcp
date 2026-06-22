@@ -69,6 +69,7 @@ export interface StartOpts {
   model?: string;
   label?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh';
+  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
 }
 
 /** Spawn a detached steerable session; returns immediately (state: starting). */
@@ -92,6 +93,7 @@ export function startSession(opts: StartOpts): SessMeta {
     '--dir', dir,
     '--cwd', cwd,
     '--model', model,
+    '--sandbox', opts.sandbox || 'danger-full-access',
     ...(opts.effort ? ['--effort', opts.effort] : []),
   ], {
     cwd,
@@ -148,6 +150,22 @@ export function sessionEvents(id: string, maxLines = 40): any[] {
   try {
     const lines = readFileSync(eventsPath(id), 'utf8').trim().split('\n').filter(Boolean);
     return lines.slice(-maxLines).map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
+  } catch { return []; }
+}
+
+/** The final assistant message the session produced (driver writes last-message.txt). */
+export function sessionFinalMessage(id: string): string {
+  try { return readFileSync(join(sessDir(id), 'last-message.txt'), 'utf8').trim(); } catch { return ''; }
+}
+
+/** Files changed in the session cwd, via git porcelain (empty if not a git repo). */
+export function sessionChangedFiles(id: string): string[] {
+  const m = readMeta(id);
+  if (!m) return [];
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync('git status --porcelain', { cwd: m.cwd, encoding: 'utf8', timeout: 5000 }) as string;
+    return out.split('\n').map((l) => l.trim()).filter(Boolean);
   } catch { return []; }
 }
 

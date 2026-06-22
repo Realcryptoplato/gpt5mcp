@@ -26,7 +26,14 @@ const DIR = arg('--dir');
 const CWD = arg('--cwd', process.cwd());
 const MODEL = arg('--model', 'gpt-5.5');
 const EFFORT = arg('--effort', null);
+const SANDBOX = arg('--sandbox', 'danger-full-access'); // danger-full-access | workspace-write | read-only
 const PROMPT = process.env.CODEX_SESSION_PROMPT || '';
+
+function sandboxPolicy() {
+  if (SANDBOX === 'read-only') return { type: 'readOnly', networkAccess: false };
+  if (SANDBOX === 'workspace-write') return { type: 'workspaceWrite' };
+  return { type: 'dangerFullAccess' };
+}
 
 const metaPath = path.join(DIR, 'meta.json');
 const controlPath = path.join(DIR, 'control.jsonl');
@@ -80,6 +87,21 @@ child.stdout.on('data', (chunk) => {
   }
 });
 
+let finalMessage = '';
+function pluckText(p) {
+  if (!p || typeof p !== 'object') return undefined;
+  if (typeof p.delta === 'string') return p.delta;
+  if (typeof p.text === 'string') return p.text;
+  if (typeof p.message === 'string') return p.message;
+  // item/completed carries an item with content
+  const item = p.item || p;
+  if (item && typeof item.text === 'string') return item.text;
+  if (item && Array.isArray(item.content)) {
+    return item.content.map((c) => (c && (c.text || c.delta)) || '').join('');
+  }
+  return undefined;
+}
+
 function handleNotification(d) {
   const m = d.method;
   // Record the interesting ones into events.jsonl (skip noisy startup spam).
@@ -89,11 +111,12 @@ function handleNotification(d) {
   if (m === 'turn/completed' || m === 'turn/failed' || m === 'turn/aborted') {
     turnActive = false;
   }
-  // Capture assistant text deltas + final messages for "what's going on".
-  let text;
-  if (p.delta && typeof p.delta === 'string') text = p.delta;
-  else if (p.message && typeof p.message === 'string') text = p.message;
-  else if (p.text && typeof p.text === 'string') text = p.text;
+  // Track the latest assistant message as the running "final message".
+  const text = pluckText(p);
+  if ((m === 'item/completed' || /agentMessage/.test(m)) && text) {
+    finalMessage = text;
+    try { fs.writeFileSync(path.join(DIR, 'last-message.txt'), finalMessage); } catch (_) {}
+  }
   logEvent({ t: Date.now(), method: m, text: text ? text.slice(0, 500) : undefined });
 }
 
@@ -134,7 +157,12 @@ const controlTimer = setInterval(pollControl, 700);
     if (!threadId) throw new Error('thread/start returned no thread id');
     writeMeta({ threadId, state: 'running' });
 
-    const turnParams = { threadId, input: [{ type: 'text', text: PROMPT }] };
+    const turnParams = {
+      threadId,
+      input: [{ type: 'text', text: PROMPT }],
+      sandboxPolicy: sandboxPolicy(),
+      approvalPolicy: 'never',
+    };
     if (EFFORT) turnParams.effort = EFFORT;
     const turn = await send('turn/start', turnParams);
     turnId = turn.result && (turn.result.turnId || turn.result.turn && turn.result.turn.id);
