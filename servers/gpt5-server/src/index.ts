@@ -15,6 +15,9 @@ import dotenv from 'dotenv';
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { callGPT5, callGPT5WithMessages, generateImage } from './utils.js';
+import {
+  dispatchCodex, getStatus, listJobs, tailLog, finalMessage, changedFiles,
+} from './codexJobs.js';
 
 // Initialize environment from parent directory
 import { dirname } from 'path';
@@ -55,11 +58,33 @@ const GPT5ImageSchema = z.object({
   aspect: z.enum(['9:16', '16:9', '1:1']).optional().default('9:16').describe("Aspect ratio")
 });
 
+// --- Async Codex worker (dispatch-and-await like a subagent) ---
+const CodexDispatchSchema = z.object({
+  prompt: z.string().describe("The full spec/task for the Codex worker. Be tight and self-contained — Codex does the build/codemod/test grind unattended."),
+  cwd: z.string().optional().describe("Working directory for the job (defaults to the server's CWD). Use the repo you want Codex to operate on."),
+  model: z.string().optional().default("gpt-5.5").describe("Codex model (via the CLI)"),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().default('danger-full-access').describe("Execution sandbox. danger-full-access = files + commands + network, unattended (default for the delegated-worker setup)."),
+  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional().describe("Codex reasoning effort"),
+  label: z.string().optional().describe("Short human label for the job (shown in status)")
+});
+
+const CodexStatusSchema = z.object({
+  job_id: z.string().optional().describe("Job id to check. Omit to list ALL jobs (most recent first)."),
+  tail: z.boolean().optional().default(true).describe("Include a tail of the job's output log")
+});
+
+const CodexResultSchema = z.object({
+  job_id: z.string().describe("Job id to collect the final result from")
+});
+
 
 // Type definitions
 type GPT5GenerateArgs = z.infer<typeof GPT5GenerateSchema>;
 type GPT5ImageArgs = z.infer<typeof GPT5ImageSchema>;
 type GPT5MessagesArgs = z.infer<typeof GPT5MessagesSchema>;
+type CodexDispatchArgs = z.infer<typeof CodexDispatchSchema>;
+type CodexStatusArgs = z.infer<typeof CodexStatusSchema>;
+type CodexResultArgs = z.infer<typeof CodexResultSchema>;
 
 // Usage doc exposed as an MCP resource so connecting clients can fetch a
 // human-readable README through the protocol (in addition to tools/list, which
@@ -78,6 +103,10 @@ Run \`codex login\` once if not authenticated. Defaults to model **gpt-5.5**.
   → saves a PNG to out_path FOR FREE (Codex built-in image tool / gpt-image). Returns the saved path.
 
 ## Notes
+- **Async Codex worker (subagent-style):** codex_dispatch { prompt, cwd?, sandbox?=danger-full-access, label? }
+  returns a job_id IMMEDIATELY (non-blocking); codex_status { job_id?, tail? } reports
+  { state, exitCode, durationMs, filesChanged, tail }; codex_result { job_id } returns the
+  finalMessage once done. Jobs persist under ~/.gpt5mcp/codex-jobs/ and survive a restart.
 - Image gen is agentic (the model writes the file); allow up to ~4 min.
 - API-only model snapshots are irrelevant here — the CLI session picks the backing model.
 - Full machine-readable param schemas: call \`tools/list\`.
@@ -154,6 +183,21 @@ async function main() {
             description: "Generate an image FOR FREE via the Codex CLI's built-in image tool (ChatGPT OAuth / gpt-image — no API key, no credits). Saves a PNG to out_path.",
             inputSchema: zodToJsonSchema(GPT5ImageSchema),
           },
+          {
+            name: "codex_dispatch",
+            description: "Dispatch a Codex worker as a background job (like spawning a subagent) — runs `codex exec` detached and returns a job_id IMMEDIATELY (non-blocking). Codex does the heavy build/codemod/test grind unattended. Poll with codex_status, collect with codex_result.",
+            inputSchema: zodToJsonSchema(CodexDispatchSchema),
+          },
+          {
+            name: "codex_status",
+            description: "Check a dispatched Codex job (or list all). Returns structured status {state: running|completed|failed, exitCode, durationMs, filesChanged, tail of log}. Non-blocking — call repeatedly until state != running.",
+            inputSchema: zodToJsonSchema(CodexStatusSchema),
+          },
+          {
+            name: "codex_result",
+            description: "Collect the final result of a completed Codex job: its final message, exit code, and the list of files it changed (git porcelain). Call once codex_status reports completed/failed.",
+            inputSchema: zodToJsonSchema(CodexResultSchema),
+          },
         ]
       };
     }
@@ -227,6 +271,80 @@ async function main() {
             return {
               content: [{ type: "text", text: result.content }],
               ...(result.error ? { isError: true } : {})
+            };
+          }
+
+          case "codex_dispatch": {
+            const args = CodexDispatchSchema.parse(request.params.arguments) as CodexDispatchArgs;
+            const job = dispatchCodex({
+              prompt: args.prompt,
+              cwd: args.cwd,
+              model: args.model,
+              sandbox: args.sandbox,
+              reasoning_effort: args.reasoning_effort,
+              label: args.label,
+            });
+            console.error(`Codex dispatch: ${job.id} (${args.sandbox}) cwd=${job.cwd}`);
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  job_id: job.id,
+                  state: job.state,
+                  cwd: job.cwd,
+                  model: job.model,
+                  sandbox: job.sandbox,
+                  pid: job.pid,
+                  note: "Dispatched. Poll codex_status with this job_id; collect with codex_result when state != running.",
+                }, null, 2),
+              }],
+            };
+          }
+
+          case "codex_status": {
+            const args = CodexStatusSchema.parse(request.params.arguments) as CodexStatusArgs;
+            if (!args.job_id) {
+              const all = listJobs().map((s) => ({
+                job_id: s.id, state: s.state, label: s.label,
+                startedAt: s.startedAt, durationMs: s.durationMs, exitCode: s.exitCode,
+              }));
+              return { content: [{ type: "text", text: JSON.stringify(all, null, 2) }] };
+            }
+            const s = getStatus(args.job_id);
+            if (!s) {
+              return { content: [{ type: "text", text: `Unknown job: ${args.job_id}` }], isError: true };
+            }
+            const payload: any = {
+              job_id: s.id, state: s.state, label: s.label,
+              exitCode: s.exitCode, durationMs: s.durationMs,
+              startedAt: s.startedAt, endedAt: s.endedAt, cwd: s.cwd,
+            };
+            if (s.state !== 'running') payload.filesChanged = changedFiles(s.id);
+            if (args.tail) payload.tail = tailLog(s.id);
+            return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+          }
+
+          case "codex_result": {
+            const args = CodexResultSchema.parse(request.params.arguments) as CodexResultArgs;
+            const s = getStatus(args.job_id);
+            if (!s) {
+              return { content: [{ type: "text", text: `Unknown job: ${args.job_id}` }], isError: true };
+            }
+            if (s.state === 'running') {
+              return {
+                content: [{ type: "text", text: JSON.stringify({
+                  job_id: s.id, state: 'running',
+                  note: "Still running — call codex_status to poll; codex_result only returns once finished.",
+                }, null, 2) }],
+              };
+            }
+            return {
+              content: [{ type: "text", text: JSON.stringify({
+                job_id: s.id, state: s.state, exitCode: s.exitCode,
+                durationMs: s.durationMs, filesChanged: changedFiles(s.id),
+                finalMessage: finalMessage(s.id),
+              }, null, 2) }],
+              ...(s.state === 'failed' ? { isError: true } : {}),
             };
           }
 
