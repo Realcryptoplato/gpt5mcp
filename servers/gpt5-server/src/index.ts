@@ -18,6 +18,9 @@ import { callGPT5, callGPT5WithMessages, generateImage } from './utils.js';
 import {
   dispatchCodex, getStatus, listJobs, tailLog, finalMessage, changedFiles,
 } from './codexJobs.js';
+import {
+  startSession, steerSession, interruptSession, getSession, listSessions, sessionEvents,
+} from './codexSession.js';
 
 // Initialize environment from parent directory
 import { dirname } from 'path';
@@ -77,6 +80,29 @@ const CodexResultSchema = z.object({
   job_id: z.string().describe("Job id to collect the final result from")
 });
 
+// --- Steerable Codex session (app-server: dispatch -> watch -> steer mid-run) ---
+const CodexSessionStartSchema = z.object({
+  prompt: z.string().describe("The task/spec to start the Codex session with."),
+  cwd: z.string().optional().describe("Working directory (defaults to server CWD)."),
+  model: z.string().optional().default("gpt-5.5").describe("Codex model"),
+  effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional().describe("Reasoning effort"),
+  label: z.string().optional().describe("Short human label")
+});
+
+const CodexSessionWatchSchema = z.object({
+  session_id: z.string().optional().describe("Session id to inspect. Omit to list ALL sessions."),
+  events: z.number().optional().default(40).describe("How many recent events to return (assistant text + turn lifecycle)")
+});
+
+const CodexSteerSchema = z.object({
+  session_id: z.string().describe("Session id to steer"),
+  text: z.string().describe("Guidance to inject into the running turn (e.g. 'stop, you're going wrong — do X instead').")
+});
+
+const CodexInterruptSchema = z.object({
+  session_id: z.string().describe("Session id to interrupt (sends turn/interrupt)")
+});
+
 
 // Type definitions
 type GPT5GenerateArgs = z.infer<typeof GPT5GenerateSchema>;
@@ -85,6 +111,10 @@ type GPT5MessagesArgs = z.infer<typeof GPT5MessagesSchema>;
 type CodexDispatchArgs = z.infer<typeof CodexDispatchSchema>;
 type CodexStatusArgs = z.infer<typeof CodexStatusSchema>;
 type CodexResultArgs = z.infer<typeof CodexResultSchema>;
+type CodexSessionStartArgs = z.infer<typeof CodexSessionStartSchema>;
+type CodexSessionWatchArgs = z.infer<typeof CodexSessionWatchSchema>;
+type CodexSteerArgs = z.infer<typeof CodexSteerSchema>;
+type CodexInterruptArgs = z.infer<typeof CodexInterruptSchema>;
 
 // Usage doc exposed as an MCP resource so connecting clients can fetch a
 // human-readable README through the protocol (in addition to tools/list, which
@@ -107,6 +137,17 @@ Run \`codex login\` once if not authenticated. Defaults to model **gpt-5.5**.
   returns a job_id IMMEDIATELY (non-blocking); codex_status { job_id?, tail? } reports
   { state, exitCode, durationMs, filesChanged, tail }; codex_result { job_id } returns the
   finalMessage once done. Jobs persist under ~/.gpt5mcp/codex-jobs/ and survive a restart.
+  This path uses one-shot \`codex exec\` (no steering).
+- **Steerable Codex session (app-server):** codex_session_start { prompt, cwd?, model?, effort?, label? }
+  returns { session_id, thread_id } IMMEDIATELY (non-blocking, like a subagent); the session
+  runs a long-lived app-server thread you can course-correct.
+    - codex_session_watch { session_id?, events? } -> { state, threadId, turnId, events[] }
+      (assistant text + turn lifecycle) — what Codex is doing right now. Omit id to list all.
+    - codex_steer { session_id, text } -> injects guidance into the RUNNING turn (turn/steer),
+      e.g. "stop, that's wrong — do X". Codex picks it up mid-execution.
+    - codex_interrupt { session_id } -> turn/interrupt (stop the turn, keep the thread).
+  Sessions persist under ~/.gpt5mcp/codex-sessions/. Pattern: dispatch -> watch on your own
+  schedule -> steer if it's drifting -> let it finish.
 - Image gen is agentic (the model writes the file); allow up to ~4 min.
 - API-only model snapshots are irrelevant here — the CLI session picks the backing model.
 - Full machine-readable param schemas: call \`tools/list\`.
@@ -197,6 +238,26 @@ async function main() {
             name: "codex_result",
             description: "Collect the final result of a completed Codex job: its final message, exit code, and the list of files it changed (git porcelain). Call once codex_status reports completed/failed.",
             inputSchema: zodToJsonSchema(CodexResultSchema),
+          },
+          {
+            name: "codex_session_start",
+            description: "Start a STEERABLE Codex session (app-server thread/turn) — non-blocking, returns {session_id, thread_id} IMMEDIATELY. Unlike codex_dispatch, you can inject guidance mid-run with codex_steer. Use for long tasks you want to monitor and course-correct.",
+            inputSchema: zodToJsonSchema(CodexSessionStartSchema),
+          },
+          {
+            name: "codex_session_watch",
+            description: "Check on a steerable session (or list all): returns {state, threadId, turnId} + recent events (assistant text deltas, turn lifecycle) — i.e. what Codex is currently doing. Non-blocking; call whenever you want to decide if a steer is needed.",
+            inputSchema: zodToJsonSchema(CodexSessionWatchSchema),
+          },
+          {
+            name: "codex_steer",
+            description: "Inject guidance into a RUNNING Codex session's active turn (turn/steer) — e.g. 'stop, that approach is wrong, do X instead'. The steering message is picked up by Codex mid-execution. Use after codex_session_watch shows it going the wrong way.",
+            inputSchema: zodToJsonSchema(CodexSteerSchema),
+          },
+          {
+            name: "codex_interrupt",
+            description: "Interrupt a running Codex session's turn (turn/interrupt) — stop the current work without killing the thread.",
+            inputSchema: zodToJsonSchema(CodexInterruptSchema),
           },
         ]
       };
@@ -346,6 +407,51 @@ async function main() {
               }, null, 2) }],
               ...(s.state === 'failed' ? { isError: true } : {}),
             };
+          }
+
+          case "codex_session_start": {
+            const args = CodexSessionStartSchema.parse(request.params.arguments) as CodexSessionStartArgs;
+            const m = startSession({
+              prompt: args.prompt, cwd: args.cwd, model: args.model,
+              effort: args.effort, label: args.label,
+            });
+            console.error(`Codex session start: ${m.id} cwd=${m.cwd}`);
+            return {
+              content: [{ type: "text", text: JSON.stringify({
+                session_id: m.id, state: m.state, cwd: m.cwd, model: m.model,
+                note: "Steerable session starting. Poll codex_session_watch; inject guidance with codex_steer; stop with codex_interrupt.",
+              }, null, 2) }],
+            };
+          }
+
+          case "codex_session_watch": {
+            const args = CodexSessionWatchSchema.parse(request.params.arguments) as CodexSessionWatchArgs;
+            if (!args.session_id) {
+              const all = listSessions().map((m) => ({
+                session_id: m.id, state: m.state, label: m.label, startedAt: m.startedAt,
+              }));
+              return { content: [{ type: "text", text: JSON.stringify(all, null, 2) }] };
+            }
+            const m = getSession(args.session_id);
+            if (!m) return { content: [{ type: "text", text: `Unknown session: ${args.session_id}` }], isError: true };
+            return { content: [{ type: "text", text: JSON.stringify({
+              session_id: m.id, state: m.state, threadId: m.threadId, turnId: m.turnId,
+              label: m.label, startedAt: m.startedAt, endedAt: m.endedAt, error: m.error,
+              events: sessionEvents(m.id, args.events),
+            }, null, 2) }] };
+          }
+
+          case "codex_steer": {
+            const args = CodexSteerSchema.parse(request.params.arguments) as CodexSteerArgs;
+            const r = steerSession(args.session_id, args.text);
+            console.error(`Codex steer ${args.session_id}: ${r.ok}`);
+            return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }], ...(r.ok ? {} : { isError: true }) };
+          }
+
+          case "codex_interrupt": {
+            const args = CodexInterruptSchema.parse(request.params.arguments) as CodexInterruptArgs;
+            const r = interruptSession(args.session_id);
+            return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }], ...(r.ok ? {} : { isError: true }) };
           }
 
           default:

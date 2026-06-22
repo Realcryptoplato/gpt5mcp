@@ -1,0 +1,158 @@
+#!/usr/bin/env node
+/*
+ * Codex app-server session driver (CommonJS, no build step).
+ *
+ * Owns one `codex app-server` child over stdio, drives the JSON-RPC protocol:
+ *   initialize -> thread/start -> turn/start, then watches <dir>/control.jsonl
+ *   for { cmd: "steer", text } / { cmd: "interrupt" } and issues turn/steer /
+ *   turn/interrupt against the active turn.
+ *
+ * Streams app-server notifications (assistant deltas, turn lifecycle) into
+ * <dir>/events.jsonl and keeps <dir>/meta.json current with {state, threadId,
+ * turnId}. Exits when the turn completes (or on interrupt+completion).
+ *
+ * Args: --dir <sessionDir> --cwd <cwd> --model <model> [--effort <level>]
+ * The initial prompt is passed via env CODEX_SESSION_PROMPT.
+ */
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+function arg(name, def) {
+  const i = process.argv.indexOf(name);
+  return i >= 0 ? process.argv[i + 1] : def;
+}
+const DIR = arg('--dir');
+const CWD = arg('--cwd', process.cwd());
+const MODEL = arg('--model', 'gpt-5.5');
+const EFFORT = arg('--effort', null);
+const PROMPT = process.env.CODEX_SESSION_PROMPT || '';
+
+const metaPath = path.join(DIR, 'meta.json');
+const controlPath = path.join(DIR, 'control.jsonl');
+const eventsPath = path.join(DIR, 'events.jsonl');
+
+function readMeta() { try { return JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch { return {}; } }
+function writeMeta(patch) {
+  const m = Object.assign(readMeta(), patch);
+  fs.writeFileSync(metaPath, JSON.stringify(m, null, 2));
+  return m;
+}
+function logEvent(obj) {
+  try { fs.appendFileSync(eventsPath, JSON.stringify(obj) + '\n'); } catch (_) {}
+}
+
+// ---- app-server child + JSON-RPC plumbing -------------------------------
+const child = spawn('codex', ['app-server'], {
+  cwd: CWD, stdio: ['pipe', 'pipe', 'inherit'], env: process.env,
+});
+
+let nextId = 1;
+const pending = new Map(); // id -> resolve
+function send(method, params) {
+  const id = nextId++;
+  const msg = { id, method, params: params || {} };
+  child.stdin.write(JSON.stringify(msg) + '\n');
+  return new Promise((resolve) => pending.set(id, resolve));
+}
+
+let threadId = null;
+let turnId = null;
+let turnActive = false;
+
+// line-buffered stdout parse
+let buf = '';
+child.stdout.on('data', (chunk) => {
+  buf += chunk.toString();
+  let nl;
+  while ((nl = buf.indexOf('\n')) >= 0) {
+    const line = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (!line) continue;
+    let d;
+    try { d = JSON.parse(line); } catch { continue; }
+    if (d.id !== undefined && (d.result !== undefined || d.error !== undefined)) {
+      const r = pending.get(d.id); pending.delete(d.id);
+      if (r) r(d);
+    } else if (d.method) {
+      handleNotification(d);
+    }
+  }
+});
+
+function handleNotification(d) {
+  const m = d.method;
+  // Record the interesting ones into events.jsonl (skip noisy startup spam).
+  if (/mcpServer\/startupStatus|remoteControl\//.test(m)) return;
+  const p = d.params || {};
+  if (m === 'turn/started') { turnActive = true; }
+  if (m === 'turn/completed' || m === 'turn/failed' || m === 'turn/aborted') {
+    turnActive = false;
+  }
+  // Capture assistant text deltas + final messages for "what's going on".
+  let text;
+  if (p.delta && typeof p.delta === 'string') text = p.delta;
+  else if (p.message && typeof p.message === 'string') text = p.message;
+  else if (p.text && typeof p.text === 'string') text = p.text;
+  logEvent({ t: Date.now(), method: m, text: text ? text.slice(0, 500) : undefined });
+}
+
+// ---- control file watcher (steer / interrupt) ---------------------------
+let controlOffset = 0;
+function pollControl() {
+  let data = '';
+  try { data = fs.readFileSync(controlPath, 'utf8'); } catch { return; }
+  if (data.length <= controlOffset) return;
+  const fresh = data.slice(controlOffset);
+  controlOffset = data.length;
+  for (const line of fresh.split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    let cmd; try { cmd = JSON.parse(s); } catch { continue; }
+    if (cmd.cmd === 'steer' && threadId && turnId) {
+      logEvent({ t: Date.now(), method: 'client/steer', text: cmd.text });
+      send('turn/steer', {
+        threadId, expectedTurnId: turnId,
+        input: [{ type: 'text', text: cmd.text }],
+      }).then((r) => {
+        if (r && r.error) logEvent({ t: Date.now(), method: 'client/steer/error', text: JSON.stringify(r.error) });
+      });
+    } else if (cmd.cmd === 'interrupt' && threadId) {
+      logEvent({ t: Date.now(), method: 'client/interrupt' });
+      send('turn/interrupt', { threadId, turnId }).catch(() => {});
+    }
+  }
+}
+const controlTimer = setInterval(pollControl, 700);
+
+// ---- main flow ----------------------------------------------------------
+(async () => {
+  try {
+    await send('initialize', { clientInfo: { name: 'gpt5-server-driver', version: '1.0' } });
+    const ts = await send('thread/start', { cwd: CWD });
+    threadId = ts.result && ts.result.thread && ts.result.thread.id;
+    if (!threadId) throw new Error('thread/start returned no thread id');
+    writeMeta({ threadId, state: 'running' });
+
+    const turnParams = { threadId, input: [{ type: 'text', text: PROMPT }] };
+    if (EFFORT) turnParams.effort = EFFORT;
+    const turn = await send('turn/start', turnParams);
+    turnId = turn.result && (turn.result.turnId || turn.result.turn && turn.result.turn.id);
+    turnActive = true;
+    writeMeta({ turnId, state: 'running' });
+
+    // Wait for the turn to finish (turnActive flipped by notifications).
+    await new Promise((resolve) => {
+      const iv = setInterval(() => { if (!turnActive) { clearInterval(iv); resolve(); } }, 800);
+    });
+
+    writeMeta({ state: 'completed', endedAt: new Date().toISOString() });
+  } catch (e) {
+    writeMeta({ state: 'failed', error: String(e && e.message || e), endedAt: new Date().toISOString() });
+    logEvent({ t: Date.now(), method: 'driver/error', text: String(e) });
+  } finally {
+    clearInterval(controlTimer);
+    try { child.stdin.end(); } catch (_) {}
+    setTimeout(() => { try { child.kill(); } catch (_) {} process.exit(0); }, 500);
+  }
+})();
