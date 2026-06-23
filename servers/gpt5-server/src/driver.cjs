@@ -50,22 +50,43 @@ function logEvent(obj) {
 }
 
 // ---- app-server child + JSON-RPC plumbing -------------------------------
+// Capture stderr (don't just inherit) so we can surface WHY a job failed
+// (config errors, codex crashes, bad cwd) into the job's error field.
+let stderrTail = '';
+function appendStderr(s) {
+  stderrTail = (stderrTail + s).slice(-4000); // keep the last ~4KB
+}
 const child = spawn('codex', ['app-server'], {
-  cwd: CWD, stdio: ['pipe', 'pipe', 'inherit'], env: process.env,
+  cwd: CWD, stdio: ['pipe', 'pipe', 'pipe'], env: process.env,
 });
+child.stderr.on('data', (d) => { const s = d.toString(); appendStderr(s); try { fs.appendFileSync(path.join(DIR, 'driver.log'), s); } catch (_) {} });
+let childExited = null;
+child.on('exit', (code, sig) => { childExited = { code, sig }; });
+child.on('error', (e) => { appendStderr(`\n[spawn error] ${e.message}\n`); });
 
 let nextId = 1;
-const pending = new Map(); // id -> resolve
-function send(method, params) {
+const pending = new Map(); // id -> {resolve, timer}
+// send() now rejects on timeout so a dead/unresponsive app-server surfaces an
+// error instead of hanging silently.
+function send(method, params, timeoutMs = 60000) {
   const id = nextId++;
   const msg = { id, method, params: params || {} };
-  child.stdin.write(JSON.stringify(msg) + '\n');
-  return new Promise((resolve) => pending.set(id, resolve));
+  try { child.stdin.write(JSON.stringify(msg) + '\n'); }
+  catch (e) { return Promise.reject(new Error(`write to app-server failed: ${e.message}`)); }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      const hint = childExited ? ` (app-server exited code=${childExited.code})` : '';
+      reject(new Error(`${method} timed out after ${timeoutMs}ms${hint}. stderr tail:\n${stderrTail.trim().slice(-800)}`));
+    }, timeoutMs);
+    pending.set(id, { resolve, timer });
+  });
 }
 
 let threadId = null;
 let turnId = null;
 let turnActive = false;
+let turnFailure = null;
 
 // line-buffered stdout parse
 let buf = '';
@@ -79,8 +100,8 @@ child.stdout.on('data', (chunk) => {
     let d;
     try { d = JSON.parse(line); } catch { continue; }
     if (d.id !== undefined && (d.result !== undefined || d.error !== undefined)) {
-      const r = pending.get(d.id); pending.delete(d.id);
-      if (r) r(d);
+      const p = pending.get(d.id); pending.delete(d.id);
+      if (p) { clearTimeout(p.timer); p.resolve(d); }
     } else if (d.method) {
       handleNotification(d);
     }
@@ -110,6 +131,11 @@ function handleNotification(d) {
   if (m === 'turn/started') { turnActive = true; }
   if (m === 'turn/completed' || m === 'turn/failed' || m === 'turn/aborted') {
     turnActive = false;
+    if (m === 'turn/failed' || m === 'turn/aborted') {
+      // capture WHY the turn failed so codex_result isn't empty
+      const reason = (p && (p.error || p.reason || p.message)) || pluckText(p) || m;
+      turnFailure = typeof reason === 'string' ? reason : JSON.stringify(reason);
+    }
   }
   // Track the latest assistant message as the running "final message".
   const text = pluckText(p);
@@ -149,12 +175,24 @@ function pollControl() {
 const controlTimer = setInterval(pollControl, 700);
 
 // ---- main flow ----------------------------------------------------------
+function rpcError(label, d) {
+  // d is a JSON-RPC response; if it carries an error, throw with detail + stderr.
+  if (d && d.error) {
+    const msg = typeof d.error === 'object' ? (d.error.message || JSON.stringify(d.error)) : String(d.error);
+    throw new Error(`${label} error: ${msg}${stderrTail ? `\nstderr tail:\n${stderrTail.trim().slice(-800)}` : ''}`);
+  }
+  return d;
+}
+
 (async () => {
   try {
-    await send('initialize', { clientInfo: { name: 'gpt5-server-driver', version: '1.0' } });
-    const ts = await send('thread/start', { cwd: CWD });
+    rpcError('initialize', await send('initialize', { clientInfo: { name: 'gpt5-server-driver', version: '1.0' } }, 30000));
+    const ts = rpcError('thread/start', await send('thread/start', { cwd: CWD }, 30000));
     threadId = ts.result && ts.result.thread && ts.result.thread.id;
-    if (!threadId) throw new Error('thread/start returned no thread id');
+    if (!threadId) {
+      throw new Error(`thread/start returned no thread id (cwd=${CWD} may be invalid)`
+        + `${stderrTail ? `\nstderr tail:\n${stderrTail.trim().slice(-800)}` : ''}`);
+    }
     writeMeta({ threadId, state: 'running' });
 
     const turnParams = {
@@ -164,20 +202,31 @@ const controlTimer = setInterval(pollControl, 700);
       approvalPolicy: 'never',
     };
     if (EFFORT) turnParams.effort = EFFORT;
-    const turn = await send('turn/start', turnParams);
+    const turn = rpcError('turn/start', await send('turn/start', turnParams, 30000));
     turnId = turn.result && (turn.result.turnId || turn.result.turn && turn.result.turn.id);
     turnActive = true;
     writeMeta({ turnId, state: 'running' });
 
-    // Wait for the turn to finish (turnActive flipped by notifications).
+    // Wait for the turn to finish (turnActive flipped by notifications). Bail if
+    // the app-server dies so we don't hang.
     await new Promise((resolve) => {
-      const iv = setInterval(() => { if (!turnActive) { clearInterval(iv); resolve(); } }, 800);
+      const iv = setInterval(() => {
+        if (!turnActive || childExited) { clearInterval(iv); resolve(); }
+      }, 800);
     });
 
-    writeMeta({ state: 'completed', endedAt: new Date().toISOString() });
+    if (turnFailure) {
+      writeMeta({ state: 'failed', error: `turn failed: ${turnFailure}`, endedAt: new Date().toISOString() });
+      logEvent({ t: Date.now(), method: 'driver/turn-failed', text: turnFailure });
+    } else if (childExited && !finalMessage) {
+      writeMeta({ state: 'failed', error: `app-server exited (code=${childExited.code}) before turn completed.`
+        + `${stderrTail ? `\nstderr tail:\n${stderrTail.trim().slice(-800)}` : ''}`, endedAt: new Date().toISOString() });
+    } else {
+      writeMeta({ state: 'completed', endedAt: new Date().toISOString() });
+    }
   } catch (e) {
     writeMeta({ state: 'failed', error: String(e && e.message || e), endedAt: new Date().toISOString() });
-    logEvent({ t: Date.now(), method: 'driver/error', text: String(e) });
+    logEvent({ t: Date.now(), method: 'driver/error', text: String(e && e.message || e) });
   } finally {
     clearInterval(controlTimer);
     try { child.stdin.end(); } catch (_) {}

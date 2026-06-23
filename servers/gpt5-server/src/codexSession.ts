@@ -159,14 +159,20 @@ function remotePrelude(repo: string | undefined, branch: string, jobBranch: stri
   }
   const name = repo.split('/').pop();
   return [
-    `You are running on a REMOTE worker host. Follow this setup EXACTLY before the task:`,
-    `1. mkdir -p ${workRoot} && cd ${workRoot}`,
+    `You are running on a REMOTE worker host. Do this setup FIRST, and if any step`,
+    `fails, STOP and report the exact failing command + its stderr (do not continue):`,
+    `1. mkdir -p ${workRoot} && cd ${workRoot}  (if this fails, report and stop)`,
     `2. If the directory "${name}" exists: cd ${name} && git fetch origin && git checkout ${branch} && git pull --ff-only`,
     `   else: gh repo clone ${repo} ${name} && cd ${name} && git checkout ${branch}`,
-    `3. Create a working branch: git checkout -b ${jobBranch}`,
+    `   (if clone/checkout fails — e.g. no auth, repo not found — report stderr and stop)`,
+    `3. Ensure a git identity exists (commits fail without one):`,
+    `   git config user.email >/dev/null 2>&1 || git config user.email "codex-worker@local"`,
+    `   git config user.name  >/dev/null 2>&1 || git config user.name  "Codex Worker"`,
+    `4. Create a working branch: git checkout -b ${jobBranch}`,
     `Then perform the task below in that repo.`,
     `WHEN DONE: commit your work, push the branch (git push -u origin ${jobBranch}),`,
     `and open a PR with: gh pr create --fill --head ${jobBranch}. Print the PR URL.`,
+    `If you could not complete the task, clearly state WHY in your final message.`,
     ``,
     `=== TASK ===`,
     ``,
@@ -222,18 +228,35 @@ export function startSession(opts: StartOpts): SessMeta {
     throw new DispatchPreflightError(
       `Remote ${host} codex config is invalid and could not be auto-fixed: ${remoteSan.report}`);
   }
+  // Ensure a GLOBAL git identity on the remote so freshly-cloned repos can commit
+  // (a repo with no user.name/email fails at commit time). Idempotent: only sets
+  // if missing, never overrides an existing identity.
+  targetTry(target,
+    `git config --global user.email >/dev/null 2>&1 || git config --global user.email "codex-worker@local"; ` +
+    `git config --global user.name  >/dev/null 2>&1 || git config --global user.name  "Codex Worker"`,
+    10000);
   // Resolve absolute paths ON THE REMOTE once, so $HOME/~ never leak into
   // single-quoted contexts where they wouldn't expand.
   const remoteHome = targetExec(target, 'echo "$HOME"').trim();
   const workRootRaw = target.workRoot || '~/dev';
   const workRoot = workRootRaw.replace(/^~(?=\/|$)/, remoteHome);
+  // Ensure the work root exists NOW so the app-server has a valid cwd. (The repo
+  // subdir may not exist yet — Codex clones it during the turn — so we start the
+  // session in workRoot, and Codex cd's into the repo as part of its task.)
+  const mkWork = targetTry(target, `mkdir -p '${workRoot}' && cd '${workRoot}' && pwd`, 10000);
+  if (!mkWork.ok || !mkWork.out.trim()) {
+    throw new DispatchPreflightError(
+      `Remote ${host}: cannot create/access work root '${workRoot}': ${mkWork.out.trim().slice(0, 200)}`);
+  }
   const remoteDir = `${remoteHome}/.gpt5mcp/codex-sessions/${id}`;
   const jobBranch = `codex/${id}`;
   const fullPrompt = remotePrelude(opts.repo, branch, jobBranch, workRoot) + opts.prompt;
-  const cwd = opts.repo ? `${workRoot}/${opts.repo.split('/').pop()}` : workRoot;
+  // app-server cwd = workRoot (exists). The repo dir is created by Codex's task.
+  const cwd = workRoot;
+  const reportedCwd = opts.repo ? `${workRoot}/${opts.repo.split('/').pop()}` : workRoot;
 
   const meta: SessMeta = {
-    id, cwd, model, state: 'starting', startedAt, label: opts.label,
+    id, cwd: reportedCwd, model, state: 'starting', startedAt, label: opts.label,
     target: opts.target, host, repo: opts.repo, branch,
     ...(remoteSan.changed ? { configNote: remoteSan.report } : {}),
   };

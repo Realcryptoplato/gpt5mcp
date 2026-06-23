@@ -143,6 +143,12 @@ non-blocking; you watch, course-correct, and collect by the same job_id.
     invalid top-level field (this has happened with service_tier), the offending
     line is backed up + commented out so the job isn't broken. A [table]-header
     error is reported, not auto-edited. Surfaced as configFixed in the result.
+  - **Remote bootstrap robustness:** the work root is created/verified before
+    launch (fast clear failure if it can't be made), a global git identity is set
+    on the remote if missing (so freshly-cloned repos can commit), and the git
+    prelude tells Codex to STOP + report stderr on any setup failure. Setup
+    failures surface in codex_result's finalMessage (the failing command + its
+    stderr) instead of an empty state:failed.
 - **codex_status** { job_id?, events? } -> { state: starting|running|completed|failed, threadId,
   turnId, events[] }. The events are what Codex is doing now (assistant text + turn lifecycle).
   Omit job_id to list all jobs.
