@@ -69,6 +69,7 @@ const CodexDispatchSchema = z.object({
   target: z.string().optional().default("local").describe("Where to run: 'local' (this machine, default), a preset like 'mini' (the Mac Mini over Tailscale), or a raw 'user@host'. REMOTE jobs survive the laptop closing — reconnect later with codex_status."),
   repo: z.string().optional().describe("REMOTE only: GitHub slug 'owner/name'. The remote worker clones it (or fetch+pulls if present) into its work root, works on a job branch, and opens a PR. Ignored for local."),
   branch: z.string().optional().describe("REMOTE only: base branch to start from (default 'main')."),
+  require_codex_match: z.boolean().optional().default(true).describe("REMOTE only: refuse to dispatch unless the remote codex exists and its major.minor matches local (avoids running on an outdated/incompatible codex). Set false to override."),
   cwd: z.string().optional().describe("LOCAL only: working directory (defaults to server CWD). For remote, the workdir is derived from repo."),
   model: z.string().optional().default("gpt-5.5").describe("Codex model"),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().default('danger-full-access').describe("Execution sandbox. danger-full-access = files + commands + network, unattended (default)."),
@@ -133,6 +134,10 @@ non-blocking; you watch, course-correct, and collect by the same job_id.
   - **repo / branch** (remote only): the worker clones owner/name (or fetch+pulls
     if present) into its work root, works on a codex/<job_id> branch, and opens a
     PR when done. cwd is for LOCAL jobs.
+  - **Preflight (remote):** before dispatch, the remote codex must exist and its
+    major.minor must match local (so you never run on an outdated/incompatible
+    codex). Mismatch -> dispatch fails with the fix command. Override with
+    require_codex_match=false.
 - **codex_status** { job_id?, events? } -> { state: starting|running|completed|failed, threadId,
   turnId, events[] }. The events are what Codex is doing now (assistant text + turn lifecycle).
   Omit job_id to list all jobs.
@@ -323,11 +328,22 @@ async function main() {
 
           case "codex_dispatch": {
             const args = CodexDispatchSchema.parse(request.params.arguments) as CodexDispatchArgs;
-            const m = startSession({
-              prompt: args.prompt, cwd: args.cwd, model: args.model,
-              sandbox: args.sandbox, effort: args.reasoning_effort, label: args.label,
-              target: args.target, repo: args.repo, branch: args.branch,
-            });
+            let m;
+            try {
+              m = startSession({
+                prompt: args.prompt, cwd: args.cwd, model: args.model,
+                sandbox: args.sandbox, effort: args.reasoning_effort, label: args.label,
+                target: args.target, repo: args.repo, branch: args.branch,
+                requireCodexMatch: args.require_codex_match,
+              });
+            } catch (e: any) {
+              // Preflight (e.g. version skew / missing remote codex) — surface
+              // the actionable message rather than a generic error.
+              return {
+                content: [{ type: "text", text: `codex_dispatch preflight failed: ${e?.message || String(e)}` }],
+                isError: true,
+              };
+            }
             const remote = m.target && m.target !== 'local';
             console.error(`Codex dispatch (steerable): ${m.id} target=${m.target} cwd=${m.cwd}`);
             return {

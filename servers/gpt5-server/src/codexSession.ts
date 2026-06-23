@@ -95,6 +95,56 @@ export interface StartOpts {
   target?: string;   // local | mini | user@host
   repo?: string;     // GitHub slug owner/name (remote: how to get the code)
   branch?: string;   // branch to work on (default main)
+  requireCodexMatch?: boolean;  // remote: require local/remote codex major.minor match (default true)
+}
+
+/** Parse "codex-cli 0.142.0" -> "0.142.0". */
+function parseCodexVersion(s: string): string | null {
+  const m = s.match(/(\d+\.\d+\.\d+)/);
+  return m ? m[1] : null;
+}
+
+/** The local codex version (or null if not found). */
+function localCodexVersion(): string | null {
+  try {
+    const { execFileSync } = require('child_process');
+    return parseCodexVersion(execFileSync('codex', ['--version'], { encoding: 'utf8', timeout: 8000 }));
+  } catch { return null; }
+}
+
+/** Compare two semver-ish strings by major.minor only (patch is fine to differ). */
+function majorMinorMatch(a: string, b: string): boolean {
+  const pa = a.split('.'), pb = b.split('.');
+  return pa[0] === pb[0] && pa[1] === pb[1];
+}
+
+export class DispatchPreflightError extends Error {}
+
+/** Verify the remote host can run a compatible codex BEFORE we set up a job.
+ *  Throws DispatchPreflightError with an actionable message on failure. */
+function preflightRemoteCodex(target: Target, requireMatch: boolean): void {
+  // codex present?
+  const which = targetTry(target, 'command -v codex');
+  if (!which.ok || !which.out.trim()) {
+    throw new DispatchPreflightError(
+      `Remote ${target.host} has no \`codex\` on PATH. Install it there ` +
+      `(npm install -g @openai/codex) and \`codex login\`, then retry.`);
+  }
+  const remoteVerRaw = targetTry(target, 'codex --version').out;
+  const remoteVer = parseCodexVersion(remoteVerRaw);
+  if (!remoteVer) {
+    throw new DispatchPreflightError(
+      `Could not read remote codex version on ${target.host} (got: ${remoteVerRaw.trim().slice(0, 80)}).`);
+  }
+  if (requireMatch) {
+    const localVer = localCodexVersion();
+    if (localVer && !majorMinorMatch(localVer, remoteVer)) {
+      throw new DispatchPreflightError(
+        `Codex version skew: local ${localVer} vs ${target.host} ${remoteVer}. ` +
+        `Update the remote: \`ssh ${target.host} 'npm install -g @openai/codex'\` ` +
+        `(or pass require_codex_match=false to dispatch anyway).`);
+    }
+  }
 }
 
 /** Build the git/setup prelude prepended to a remote job's prompt so Codex
@@ -155,6 +205,9 @@ export function startSession(opts: StartOpts): SessMeta {
 
   // --- remote (ssh) ---
   const host = target.host!;
+  // PREFLIGHT: never dispatch to a missing / version-skewed codex. Throws
+  // DispatchPreflightError with an actionable message (caller surfaces it).
+  preflightRemoteCodex(target, opts.requireCodexMatch !== false);
   // Resolve absolute paths ON THE REMOTE once, so $HOME/~ never leak into
   // single-quoted contexts where they wouldn't expand.
   const remoteHome = targetExec(target, 'echo "$HOME"').trim();
