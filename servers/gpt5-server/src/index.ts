@@ -66,7 +66,10 @@ const GPT5ImageSchema = z.object({
 // (codex_result) — all by the same job_id.
 const CodexDispatchSchema = z.object({
   prompt: z.string().describe("The full spec/task for the Codex worker. Be tight and self-contained — Codex does the build/codemod/test grind unattended."),
-  cwd: z.string().optional().describe("Working directory for the job (defaults to the server's CWD). Use the repo you want Codex to operate on."),
+  target: z.string().optional().default("local").describe("Where to run: 'local' (this machine, default), a preset like 'mini' (the Mac Mini over Tailscale), or a raw 'user@host'. REMOTE jobs survive the laptop closing — reconnect later with codex_status."),
+  repo: z.string().optional().describe("REMOTE only: GitHub slug 'owner/name'. The remote worker clones it (or fetch+pulls if present) into its work root, works on a job branch, and opens a PR. Ignored for local."),
+  branch: z.string().optional().describe("REMOTE only: base branch to start from (default 'main')."),
+  cwd: z.string().optional().describe("LOCAL only: working directory (defaults to server CWD). For remote, the workdir is derived from repo."),
   model: z.string().optional().default("gpt-5.5").describe("Codex model"),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().default('danger-full-access').describe("Execution sandbox. danger-full-access = files + commands + network, unattended (default)."),
   reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional().describe("Codex reasoning effort"),
@@ -121,8 +124,15 @@ Run \`codex login\` once if not authenticated. Defaults to model **gpt-5.5**.
 ## Codex worker (ONE steerable async engine, subagent-style)
 Every dispatched job runs a detached, STEERABLE app-server session. Dispatch is
 non-blocking; you watch, course-correct, and collect by the same job_id.
-- **codex_dispatch** { prompt, cwd?, model?, sandbox?=danger-full-access, reasoning_effort?, label? }
+- **codex_dispatch** { prompt, target?=local, repo?, branch?, cwd?, model?, sandbox?, reasoning_effort?, label? }
   -> { job_id, state } IMMEDIATELY (non-blocking).
+  - **target** = 'local' (default), a preset like 'mini' (Mac Mini over Tailscale,
+    from ~/.gpt5mcp/targets.json), or a raw 'user@host'. A REMOTE job's driver +
+    codex run ON THE REMOTE, so it SURVIVES the laptop closing / Claude quitting —
+    reconnect any time with codex_status (it reads the remote job dir over SSH).
+  - **repo / branch** (remote only): the worker clones owner/name (or fetch+pulls
+    if present) into its work root, works on a codex/<job_id> branch, and opens a
+    PR when done. cwd is for LOCAL jobs.
 - **codex_status** { job_id?, events? } -> { state: starting|running|completed|failed, threadId,
   turnId, events[] }. The events are what Codex is doing now (assistant text + turn lifecycle).
   Omit job_id to list all jobs.
@@ -316,12 +326,17 @@ async function main() {
             const m = startSession({
               prompt: args.prompt, cwd: args.cwd, model: args.model,
               sandbox: args.sandbox, effort: args.reasoning_effort, label: args.label,
+              target: args.target, repo: args.repo, branch: args.branch,
             });
-            console.error(`Codex dispatch (steerable): ${m.id} (${args.sandbox}) cwd=${m.cwd}`);
+            const remote = m.target && m.target !== 'local';
+            console.error(`Codex dispatch (steerable): ${m.id} target=${m.target} cwd=${m.cwd}`);
             return {
               content: [{ type: "text", text: JSON.stringify({
-                job_id: m.id, state: m.state, cwd: m.cwd, model: m.model, sandbox: args.sandbox,
-                note: "Dispatched (steerable). Watch with codex_status, steer mid-run with codex_steer, collect with codex_result.",
+                job_id: m.id, state: m.state, target: m.target, host: m.host,
+                cwd: m.cwd, repo: m.repo, branch: m.branch, model: m.model, sandbox: args.sandbox,
+                note: remote
+                  ? "Dispatched to REMOTE worker. It survives this laptop closing — reconnect any time with codex_status. It will push a job branch + open a PR when done."
+                  : "Dispatched (steerable). Watch with codex_status, steer mid-run with codex_steer, collect with codex_result.",
               }, null, 2) }],
             };
           }
@@ -330,14 +345,15 @@ async function main() {
             const args = CodexStatusSchema.parse(request.params.arguments) as CodexStatusArgs;
             if (!args.job_id) {
               const all = listSessions().map((m) => ({
-                job_id: m.id, state: m.state, label: m.label, startedAt: m.startedAt,
+                job_id: m.id, state: m.state, label: m.label, target: m.target, startedAt: m.startedAt,
               }));
               return { content: [{ type: "text", text: JSON.stringify(all, null, 2) }] };
             }
             const m = getSession(args.job_id);
             if (!m) return { content: [{ type: "text", text: `Unknown job: ${args.job_id}` }], isError: true };
             return { content: [{ type: "text", text: JSON.stringify({
-              job_id: m.id, state: m.state, threadId: m.threadId, turnId: m.turnId,
+              job_id: m.id, state: m.state, target: m.target, host: m.host,
+              repo: m.repo, branch: m.branch, threadId: m.threadId, turnId: m.turnId,
               label: m.label, startedAt: m.startedAt, endedAt: m.endedAt, error: m.error,
               events: sessionEvents(m.id, args.events),
             }, null, 2) }] };
