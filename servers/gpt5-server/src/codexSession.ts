@@ -24,6 +24,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import {
   Target, resolveTarget, targetExec, targetReadFile, targetAppend, targetPidAlive, targetTry,
+  sanitizeCodexConfig,
 } from './targets.js';
 
 const LOCAL_ROOT = join(homedir(), '.gpt5mcp', 'codex-sessions');
@@ -48,6 +49,7 @@ export interface SessMeta {
   host?: string;     // ssh host if remote
   repo?: string;
   branch?: string;
+  configNote?: string;  // set if the codex config was auto-sanitized before launch
 }
 
 // --- local stub: how we locate a job + its host ---------------------------
@@ -186,7 +188,12 @@ export function startSession(opts: StartOpts): SessMeta {
   if (target.type === 'local') {
     const dir = stubDir;
     const cwd = opts.cwd || process.cwd();
-    const meta: SessMeta = { id, cwd, model, state: 'starting', startedAt, label: opts.label, target: 'local' };
+    // Self-heal a config the Codex app may have rewritten with invalid fields.
+    const san = sanitizeCodexConfig(target);
+    const meta: SessMeta = {
+      id, cwd, model, state: 'starting', startedAt, label: opts.label, target: 'local',
+      ...(san.changed ? { configNote: san.report } : {}),
+    };
     writeFileSync(join(dir, 'meta.json'), JSON.stringify(meta, null, 2));
     writeFileSync(join(dir, 'control.jsonl'), '');
     writeFileSync(join(dir, 'events.jsonl'), '');
@@ -208,6 +215,13 @@ export function startSession(opts: StartOpts): SessMeta {
   // PREFLIGHT: never dispatch to a missing / version-skewed codex. Throws
   // DispatchPreflightError with an actionable message (caller surfaces it).
   preflightRemoteCodex(target, opts.requireCodexMatch !== false);
+  // Self-heal the remote codex config (the Codex app may have written invalid
+  // fields that would break every job on that host).
+  const remoteSan = sanitizeCodexConfig(target);
+  if (!remoteSan.ok) {
+    throw new DispatchPreflightError(
+      `Remote ${host} codex config is invalid and could not be auto-fixed: ${remoteSan.report}`);
+  }
   // Resolve absolute paths ON THE REMOTE once, so $HOME/~ never leak into
   // single-quoted contexts where they wouldn't expand.
   const remoteHome = targetExec(target, 'echo "$HOME"').trim();
@@ -221,6 +235,7 @@ export function startSession(opts: StartOpts): SessMeta {
   const meta: SessMeta = {
     id, cwd, model, state: 'starting', startedAt, label: opts.label,
     target: opts.target, host, repo: opts.repo, branch,
+    ...(remoteSan.changed ? { configNote: remoteSan.report } : {}),
   };
 
   // 1) make the remote job dir, write meta + prompt + empty channels

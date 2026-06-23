@@ -138,6 +138,11 @@ non-blocking; you watch, course-correct, and collect by the same job_id.
     major.minor must match local (so you never run on an outdated/incompatible
     codex). Mismatch -> dispatch fails with the fix command. Override with
     require_codex_match=false.
+  - **Config self-heal (local + remote):** before launch, the codex config is
+    probed with --strict-config; if the Codex desktop app rewrote it with an
+    invalid top-level field (this has happened with service_tier), the offending
+    line is backed up + commented out so the job isn't broken. A [table]-header
+    error is reported, not auto-edited. Surfaced as configFixed in the result.
 - **codex_status** { job_id?, events? } -> { state: starting|running|completed|failed, threadId,
   turnId, events[] }. The events are what Codex is doing now (assistant text + turn lifecycle).
   Omit job_id to list all jobs.
@@ -350,6 +355,7 @@ async function main() {
               content: [{ type: "text", text: JSON.stringify({
                 job_id: m.id, state: m.state, target: m.target, host: m.host,
                 cwd: m.cwd, repo: m.repo, branch: m.branch, model: m.model, sandbox: args.sandbox,
+                ...(m.configNote ? { configFixed: m.configNote } : {}),
                 note: remote
                   ? "Dispatched to REMOTE worker. It survives this laptop closing — reconnect any time with codex_status. It will push a job branch + open a PR when done."
                   : "Dispatched (steerable). Watch with codex_status, steer mid-run with codex_steer, collect with codex_result.",

@@ -80,4 +80,73 @@ export function targetPidAlive(t: Target, pid: number): boolean {
   return r.ok && /alive/.test(r.out);
 }
 
+/**
+ * Ensure ~/.codex/config.toml on the target loads cleanly. The Codex desktop app
+ * periodically rewrites config.toml with fields/values this CLI rejects (e.g.
+ * historically `service_tier`), which breaks every job. We probe with
+ * `codex exec --strict-config`; if it errors, we comment out each offending line
+ * (backing the file up first) and re-probe. Returns a short report.
+ *
+ * Idempotent and safe: only comments out lines the CLI explicitly names as
+ * unknown/invalid; never deletes or reorders anything else.
+ */
+export function sanitizeCodexConfig(t: Target): { ok: boolean; changed: boolean; report: string } {
+  const CFG = '$HOME/.codex/config.toml';
+  // Probe: run codex with --strict-config and capture stderr. We detect failure
+  // by PARSING the output for "Error loading config.toml" rather than relying on
+  // the exit code surviving the ssh/pipe wrapping (which it doesn't reliably).
+  const probe = () => targetTry(
+    t,
+    `printf 'noop' | codex exec --strict-config --skip-git-repo-check --sandbox read-only - 2>&1 | ` +
+    `grep -iE 'config\\.toml:[0-9]+:|Error loading config' || true`,
+    45000,
+  ).out;
+
+  let out = probe();
+  const bad = (s: string) => /config\.toml:\d+:|Error loading config/i.test(s);
+  if (!bad(out)) return { ok: true, changed: false, report: 'config loads cleanly' };
+
+  // Parse offending line numbers from messages like:
+  //   /path/config.toml:220:1: unknown configuration field `x`
+  //   config.toml:11:16: unknown variant `default` ... in `service_tier`
+  const lines = new Set<number>();
+  for (const m of out.matchAll(/config\.toml:(\d+):\d+:/g)) {
+    lines.add(parseInt(m[1], 10));
+  }
+  if (lines.size === 0) {
+    // Couldn't pinpoint a line — surface the raw error, don't guess-edit.
+    return { ok: false, changed: false, report: `config rejected but no line located:\n${out.trim().slice(0, 400)}` };
+  }
+
+  // Safety: never comment out a [table] header line (would break the whole
+  // section). Codex normally reports the offending field's own line; if it
+  // points at a "[...]" header we bail with the error rather than corrupt config.
+  const sorted = [...lines].sort((a, b) => a - b);
+  for (const n of sorted) {
+    const ln = targetTry(t, `sed -n '${n}p' ${CFG}`).out.trim();
+    if (/^\s*\[/.test(ln)) {
+      return { ok: false, changed: false,
+        report: `config error points at a [table] header (line ${n}: ${ln}); not auto-editing. Fix manually:\n${out.trim().slice(0, 300)}` };
+    }
+  }
+
+  // Back up once, then comment out each offending 1-based line with sed.
+  const sedExprs = sorted.map((n) => `-e '${n}s/^/# [codex-sanitize] /'`).join(' ');
+  const fix =
+    `f=${CFG}; ` +
+    `cp "$f" "$f.bak-sanitize" 2>/dev/null; ` +
+    `sed -i '' ${sedExprs} "$f" 2>/dev/null || sed -i ${sedExprs} "$f"`;  // BSD then GNU sed
+  targetExec(t, fix, 20000);
+
+  out = probe();
+  const stillBad = bad(out);
+  return {
+    ok: !stillBad,
+    changed: true,
+    report: !stillBad
+      ? `commented out invalid config line(s): ${sorted.join(', ')} (backup: config.toml.bak-sanitize)`
+      : `commented line(s) ${sorted.join(', ')} but config still rejected:\n${out.trim().slice(0, 300)}`,
+  };
+}
+
 export { spawn };
