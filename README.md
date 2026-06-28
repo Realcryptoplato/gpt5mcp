@@ -1,5 +1,14 @@
 # GPT-5 MCP Server
 
+> **⚠️ Private fork.** This is a private fork of
+> **[AllAboutAI-YT/gpt5mcp](https://github.com/AllAboutAI-YT/gpt5mcp)** — the
+> original project and author. This fork adds an async/steerable Codex dispatch
+> engine for internal infra use; it is **not** original work and makes no
+> ownership claim over the upstream code. See [NOTICE.md](NOTICE.md). The README
+> below is from upstream.
+
+---
+
 A Model Context Protocol (MCP) server that provides seamless integration with OpenAI's GPT-5 API through Claude Code. This server enables you to leverage GPT-5's advanced capabilities directly within your Claude Code workflows.
 
 ## 🚀 Features
