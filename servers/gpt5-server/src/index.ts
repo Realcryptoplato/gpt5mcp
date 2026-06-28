@@ -55,7 +55,7 @@ const GPT5MessagesSchema = z.object({
 
 const GPT5ImageSchema = z.object({
   scene: z.string().describe("Detailed scene description for the image to generate"),
-  out_path: z.string().describe("Absolute path where the PNG should be saved (e.g. /Users/greg/out/shot.png)"),
+  out_path: z.string().describe("Absolute path where the PNG should be saved (e.g. /tmp/out/shot.png)"),
   aspect: z.enum(['9:16', '16:9', '1:1']).optional().default('9:16').describe("Aspect ratio")
 });
 
