@@ -1,6 +1,6 @@
 # GPT-5 MCP Server
 
-> **⚠️ Private fork.** This is a private fork of
+> **⚠️ Fork.** This is a GitHub fork of
 > **[AllAboutAI-YT/gpt5mcp](https://github.com/AllAboutAI-YT/gpt5mcp)** — the
 > original project and author. This fork adds an async/steerable Codex dispatch
 > engine for internal infra use; it is **not** original work and makes no
