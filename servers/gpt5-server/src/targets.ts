@@ -113,6 +113,18 @@ export function sanitizeCodexConfig(t: Target): { ok: boolean; changed: boolean;
   for (const m of out.matchAll(/config\.toml:(\d+):\d+:/g)) {
     lines.add(parseInt(m[1], 10));
   }
+  // Some config parser errors name the offending key but omit the source line,
+  // for example:
+  //   unknown variant `xhigh`, expected ... in `model_reasoning_effort`
+  // In that case, locate the top-level assignment for the named key.
+  for (const m of out.matchAll(/in `([A-Za-z0-9_.-]+)`/g)) {
+    const key = m[1];
+    if (!key || key.includes('.')) continue;
+    const escaped = key.replace(/'/g, `'\\''`);
+    const line = targetTry(t, `grep -nE '^[[:space:]]*${escaped}[[:space:]]*=' ${CFG} | head -n 1 | cut -d: -f1`).out.trim();
+    const n = parseInt(line, 10);
+    if (Number.isFinite(n)) lines.add(n);
+  }
   if (lines.size === 0) {
     // Couldn't pinpoint a line — surface the raw error, don't guess-edit.
     return { ok: false, changed: false, report: `config rejected but no line located:\n${out.trim().slice(0, 400)}` };

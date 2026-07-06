@@ -28,6 +28,7 @@ const MODEL = arg('--model', 'gpt-5.5');
 const EFFORT = arg('--effort', null);
 const SANDBOX = arg('--sandbox', 'danger-full-access'); // danger-full-access | workspace-write | read-only
 const PROMPT = process.env.CODEX_SESSION_PROMPT || '';
+const CODEX_BIN = process.env.CODEX_CLI_PATH || 'codex';
 
 function sandboxPolicy() {
   if (SANDBOX === 'read-only') return { type: 'readOnly', networkAccess: false };
@@ -56,7 +57,7 @@ let stderrTail = '';
 function appendStderr(s) {
   stderrTail = (stderrTail + s).slice(-4000); // keep the last ~4KB
 }
-const child = spawn('codex', ['app-server'], {
+const child = spawn(CODEX_BIN, ['app-server'], {
   cwd: CWD, stdio: ['pipe', 'pipe', 'pipe'], env: process.env,
 });
 child.stderr.on('data', (d) => { const s = d.toString(); appendStderr(s); try { fs.appendFileSync(path.join(DIR, 'driver.log'), s); } catch (_) {} });

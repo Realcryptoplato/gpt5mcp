@@ -14,7 +14,7 @@
 // Locally we ALSO keep a tiny stub dir so we can find a remote job and know its
 // host: ~/.gpt5mcp/codex-sessions/<job_id>/target.json = { host, remoteDir }.
 
-import { spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import {
   mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, appendFileSync,
   openSync,
@@ -109,9 +109,27 @@ function parseCodexVersion(s: string): string | null {
 /** The local codex version (or null if not found). */
 function localCodexVersion(): string | null {
   try {
-    const { execFileSync } = require('child_process');
     return parseCodexVersion(execFileSync('codex', ['--version'], { encoding: 'utf8', timeout: 8000 }));
   } catch { return null; }
+}
+
+/** Prefer a modern authenticated Codex CLI for local workers. The user's shell
+ * may resolve a stale Homebrew codex first when jobs are launched through MCP. */
+function localCodexBinary(): string {
+  const candidates = [
+    process.env.GPT5_CODEX_CLI_PATH,
+    join(homedir(), '.nvm', 'versions', 'node', 'v20.19.1', 'bin', 'codex'),
+    '/Applications/Codex.app/Contents/Resources/codex',
+    process.env.CODEX_CLI_PATH,
+    'codex',
+  ].filter((p): p is string => Boolean(p));
+  for (const candidate of candidates) {
+    try {
+      execFileSync(candidate, ['--version'], { encoding: 'utf8', timeout: 8000 });
+      return candidate;
+    } catch {}
+  }
+  return 'codex';
 }
 
 /** Compare two semver-ish strings by major.minor only (patch is fine to differ). */
@@ -196,6 +214,10 @@ export function startSession(opts: StartOpts): SessMeta {
     const cwd = opts.cwd || process.cwd();
     // Self-heal a config the Codex app may have rewritten with invalid fields.
     const san = sanitizeCodexConfig(target);
+    if (!san.ok) {
+      throw new DispatchPreflightError(`Local codex config is invalid and could not be auto-fixed: ${san.report}`);
+    }
+    const codexBin = localCodexBinary();
     const meta: SessMeta = {
       id, cwd, model, state: 'starting', startedAt, label: opts.label, target: 'local',
       ...(san.changed ? { configNote: san.report } : {}),
@@ -209,7 +231,7 @@ export function startSession(opts: StartOpts): SessMeta {
       DRIVER, '--dir', dir, '--cwd', cwd, '--model', model,
       '--sandbox', opts.sandbox || 'danger-full-access',
       ...(opts.effort ? ['--effort', opts.effort] : []),
-    ], { cwd, detached: true, stdio: ['ignore', log, log], env: { ...process.env, CODEX_SESSION_PROMPT: opts.prompt } });
+    ], { cwd, detached: true, stdio: ['ignore', log, log], env: { ...process.env, CODEX_CLI_PATH: codexBin, CODEX_SESSION_PROMPT: opts.prompt } });
     meta.pid = child.pid;
     writeFileSync(join(dir, 'meta.json'), JSON.stringify(meta, null, 2));
     child.unref();
