@@ -31,7 +31,7 @@ console.error("Environment loaded from:", envPath);
 // Schema definitions
 const GPT5GenerateSchema = z.object({
   input: z.string().describe("The input text or prompt for GPT-5"),
-  model: z.string().optional().default("gpt-5.5").describe("GPT-5 model variant to use (via Codex CLI)"),
+  model: z.string().optional().describe("GPT-5 model variant to use (via Codex CLI). Omit to use the codex CLI's own configured default model — never hardcoded here."),
   instructions: z.string().optional().describe("System instructions for the model"),
   reasoning_effort: z.enum(['low', 'medium', 'high']).optional().describe("Reasoning effort level"),
   max_tokens: z.number().optional().describe("Maximum tokens to generate"),
@@ -44,7 +44,7 @@ const GPT5MessagesSchema = z.object({
     role: z.enum(['user', 'developer', 'assistant']).describe("Message role"),
     content: z.string().describe("Message content")
   })).describe("Array of conversation messages"),
-  model: z.string().optional().default("gpt-5.5").describe("GPT-5 model variant to use (via Codex CLI)"),
+  model: z.string().optional().describe("GPT-5 model variant to use (via Codex CLI). Omit to use the codex CLI's own configured default model — never hardcoded here."),
   instructions: z.string().optional().describe("System instructions for the model"),
   reasoning_effort: z.enum(['low', 'medium', 'high']).optional().describe("Reasoning effort level"),
   max_tokens: z.number().optional().describe("Maximum tokens to generate"),
@@ -71,7 +71,7 @@ const CodexDispatchSchema = z.object({
   branch: z.string().optional().describe("REMOTE only: base branch to start from (default 'main')."),
   require_codex_match: z.boolean().optional().default(true).describe("REMOTE only: refuse to dispatch unless the remote codex exists and its major.minor matches local (avoids running on an outdated/incompatible codex). Set false to override."),
   cwd: z.string().optional().describe("LOCAL only: working directory (defaults to server CWD). For remote, the workdir is derived from repo."),
-  model: z.string().optional().default("gpt-5.5").describe("Codex model"),
+  model: z.string().optional().describe("Codex model. Omit to use the codex CLI's own configured default model — never hardcoded here."),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().default('danger-full-access').describe("Execution sandbox. danger-full-access = files + commands + network, unattended (default)."),
   reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional().describe("Codex reasoning effort"),
   label: z.string().optional().describe("Short human label for the job")
@@ -112,12 +112,12 @@ type CodexInterruptArgs = z.infer<typeof CodexInterruptSchema>;
 const README = `# gpt5-server (MCP)
 
 Drives the **Codex CLI** (ChatGPT OAuth) — no OPENAI_API_KEY, no credits.
-Run \`codex login\` once if not authenticated. Defaults to model **gpt-5.5**.
+Run \`codex login\` once if not authenticated. Model defaults to the codex CLI's own configured default (~/.codex/config.toml) unless overridden per call.
 
 ## Tools
-- **gpt5_generate** { input, model?=gpt-5.5, instructions?, reasoning_effort?, max_tokens?, temperature?, top_p? }
+- **gpt5_generate** { input, model? (defaults to the codex CLI's configured default), instructions?, reasoning_effort?, max_tokens?, temperature?, top_p? }
   → text. Single-prompt generation via \`codex exec\`.
-- **gpt5_messages** { messages:[{role,content}], model?=gpt-5.5, instructions?, reasoning_effort?, ... }
+- **gpt5_messages** { messages:[{role,content}], model? (defaults to the codex CLI's configured default), instructions?, reasoning_effort?, ... }
   → text. Multi-turn transcript rendered into one Codex prompt.
 - **gpt5_image** { scene, out_path (absolute), aspect?=9:16|16:9|1:1 }
   → saves a PNG to out_path FOR FREE (Codex built-in image tool / gpt-image). Returns the saved path.
@@ -223,7 +223,7 @@ async function main() {
         tools: [
           {
             name: "gpt5_generate",
-            description: "Generate text using GPT-5 (gpt-5.5 via the Codex CLI / ChatGPT auth) from a simple input prompt",
+            description: "Generate text using GPT-5 (via the Codex CLI / ChatGPT auth, using its configured default model unless overridden) from a simple input prompt",
             inputSchema: zodToJsonSchema(GPT5GenerateSchema),
           },
           {

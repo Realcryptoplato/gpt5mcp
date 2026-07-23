@@ -201,7 +201,11 @@ function remotePrelude(repo: string | undefined, branch: string, jobBranch: stri
 export function startSession(opts: StartOpts): SessMeta {
   const id = newId();
   const target = resolveTarget(opts.target);
-  const model = opts.model || 'gpt-5.5';
+  // No hardcoded version fallback: an explicit opts.model always wins; when
+  // omitted, `model` stays undefined and driver.cjs skips --model entirely,
+  // letting codex app-server use its own configured default instead of a
+  // version pinned into this file at build time.
+  const model = opts.model;
   const branch = opts.branch || 'main';
   const startedAt = new Date().toISOString();
 
@@ -219,7 +223,7 @@ export function startSession(opts: StartOpts): SessMeta {
     }
     const codexBin = localCodexBinary();
     const meta: SessMeta = {
-      id, cwd, model, state: 'starting', startedAt, label: opts.label, target: 'local',
+      id, cwd, model: model || '(codex CLI default)', state: 'starting', startedAt, label: opts.label, target: 'local',
       ...(san.changed ? { configNote: san.report } : {}),
     };
     writeFileSync(join(dir, 'meta.json'), JSON.stringify(meta, null, 2));
@@ -228,7 +232,8 @@ export function startSession(opts: StartOpts): SessMeta {
     writeFileSync(join(dir, 'target.json'), JSON.stringify({ host: null, remoteDir: null }));
     const log = openSync(join(dir, 'driver.log'), 'a');
     const child = spawn(process.execPath, [
-      DRIVER, '--dir', dir, '--cwd', cwd, '--model', model,
+      DRIVER, '--dir', dir, '--cwd', cwd,
+      ...(model ? ['--model', model] : []),
       '--sandbox', opts.sandbox || 'danger-full-access',
       ...(opts.effort ? ['--effort', opts.effort] : []),
     ], { cwd, detached: true, stdio: ['ignore', log, log], env: { ...process.env, CODEX_CLI_PATH: codexBin, CODEX_SESSION_PROMPT: opts.prompt } });
@@ -278,7 +283,7 @@ export function startSession(opts: StartOpts): SessMeta {
   const reportedCwd = opts.repo ? `${workRoot}/${opts.repo.split('/').pop()}` : workRoot;
 
   const meta: SessMeta = {
-    id, cwd: reportedCwd, model, state: 'starting', startedAt, label: opts.label,
+    id, cwd: reportedCwd, model: model || '(codex CLI default)', state: 'starting', startedAt, label: opts.label,
     target: opts.target, host, repo: opts.repo, branch,
     ...(remoteSan.changed ? { configNote: remoteSan.report } : {}),
   };
@@ -307,7 +312,8 @@ export function startSession(opts: StartOpts): SessMeta {
     `cd ${remoteDir} && export PATH="${binDirs}:$PATH" && ` +
     `CODEX_SESSION_PROMPT="$(cat ${remoteDir}/prompt.txt)" ` +
     `nohup '${nodeBin}' ${remoteDir}/driver.cjs --dir ${remoteDir} --cwd '${cwd}' ` +
-    `--model ${model} --sandbox ${opts.sandbox || 'danger-full-access'} ` +
+    (model ? `--model ${model} ` : '') +
+    `--sandbox ${opts.sandbox || 'danger-full-access'} ` +
     (opts.effort ? `--effort ${opts.effort} ` : '') +
     `>> ${remoteDir}/driver.log 2>&1 & echo $!`;
   const pidOut = targetExec(target, launch).trim();

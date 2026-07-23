@@ -2,7 +2,10 @@
 //
 // We shell out to `codex exec` instead of calling api.openai.com directly:
 //   - No OPENAI_API_KEY needed (codex uses the logged-in ChatGPT account).
-//   - Defaults to gpt-5.5.
+//   - Defaults to the caller's local Codex CLI default model (no version
+//     pinned here — see DEFAULT_MODEL below), so this server tracks whatever
+//     model the host's `codex` install currently defaults to instead of
+//     silently downgrading callers to a stale hardcoded version.
 // The `-o <file>` flag writes ONLY the model's final message to a file, which
 // we read back as the clean response (stdout also carries codex's own logs).
 //
@@ -13,7 +16,12 @@ import { mkdtempSync, readFileSync, rmSync, existsSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-const DEFAULT_MODEL = 'gpt-5.5';
+// No version-pinned fallback: an explicit `model` from the caller always wins,
+// and GPT5MCP_DEFAULT_MODEL lets an operator pin a host-wide default without
+// editing source. Omitting both means we pass no `-m` flag at all, so the
+// codex CLI's own configured default (~/.codex/config.toml `model =`) decides
+// — which is always the current model, never something baked in at build time.
+const DEFAULT_MODEL = process.env.GPT5MCP_DEFAULT_MODEL || undefined;
 const CODEX_TIMEOUT_MS = 180_000; // 3 min — codex reasoning can be slow
 
 export interface GPT5Options {
@@ -50,21 +58,27 @@ function renderPrompt(body: string, options: GPT5Options): string {
   return parts.join('\n\n');
 }
 
-/** Run codex exec with the given prompt; resolve with the final message text. */
-function runCodex(prompt: string, model: string): Promise<{ content: string; usage?: any }> {
+/**
+ * Run codex exec with the given prompt; resolve with the final message text.
+ * `model` is optional — when omitted (undefined/empty), we don't pass `-m` at
+ * all, so the codex CLI falls back to its own configured default
+ * (~/.codex/config.toml `model =`), which always reflects the current model
+ * rather than whatever was hardcoded into this file at build time.
+ */
+function runCodex(prompt: string, model?: string): Promise<{ content: string; usage?: any }> {
   return new Promise((resolve, reject) => {
     const dir = mkdtempSync(join(tmpdir(), 'gpt5mcp-'));
     const outFile = join(dir, 'last-message.txt');
     const args = [
       'exec',
-      '-m', model,
+      ...(model ? ['-m', model] : []),
       '--skip-git-repo-check',
       '--sandbox', 'read-only',
       '-o', outFile,
       prompt,
     ];
 
-    console.error('Calling Codex:', JSON.stringify({ command: 'codex', model }));
+    console.error('Calling Codex:', JSON.stringify({ command: 'codex', model: model || '(codex CLI default)' }));
 
     const child = spawn('codex', args, {
       env: { ...process.env },

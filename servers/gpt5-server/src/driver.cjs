@@ -24,7 +24,11 @@ function arg(name, def) {
 }
 const DIR = arg('--dir');
 const CWD = arg('--cwd', process.cwd());
-const MODEL = arg('--model', 'gpt-5.5');
+// No hardcoded version fallback: when the caller doesn't pass --model, MODEL
+// is null and we omit `model` from turn/start entirely, so codex app-server
+// falls back to its own configured default (~/.codex/config.toml `model =`)
+// instead of a version pinned into this file at build time.
+const MODEL = arg('--model', null);
 const EFFORT = arg('--effort', null);
 const SANDBOX = arg('--sandbox', 'danger-full-access'); // danger-full-access | workspace-write | read-only
 const PROMPT = process.env.CODEX_SESSION_PROMPT || '';
@@ -203,6 +207,11 @@ function rpcError(label, d) {
       approvalPolicy: 'never',
     };
     if (EFFORT) turnParams.effort = EFFORT;
+    // BUGFIX: MODEL was previously parsed from --model but never actually
+    // forwarded into turn/start, so an explicit model override silently had
+    // no effect on local sessions — every local dispatch ran on whatever
+    // codex app-server's own default was, regardless of what was requested.
+    if (MODEL) turnParams.model = MODEL;
     const turn = rpcError('turn/start', await send('turn/start', turnParams, 30000));
     turnId = turn.result && (turn.result.turnId || turn.result.turn && turn.result.turn.id);
     turnActive = true;
