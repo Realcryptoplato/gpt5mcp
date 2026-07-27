@@ -980,6 +980,7 @@ function dispatchBridge(
     notify_telegram: manifest.bridge?.notifyTelegram !== false,
     model,
     reasoning_effort: reasoningEffort,
+    cwd: manifest.workspace,
   }), 'utf8').toString('base64');
   const tokenPath = `${targetHome(target)}/.gpt5mcp/bridge-token`;
   const python = [
