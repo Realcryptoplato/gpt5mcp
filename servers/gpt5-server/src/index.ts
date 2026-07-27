@@ -21,7 +21,8 @@ import {
 } from './codexSession.js';
 import {
   dispatchEmployee, fireEmployee, getEmployee, harvestEmployeeKnowledge, hireEmployee,
-  listEmployees, syncCapabilityLibrary, teamJobResult, teamJobStatus, updateEmployee,
+  listEmployees, syncCapabilityLibrary, syncEmployeePlugins, teamJobResult, teamJobStatus,
+  updateEmployee,
 } from './team.js';
 
 // Initialize environment from parent directory
@@ -204,6 +205,12 @@ const TeamLibrarySyncSchema = z.object({
   ref: z.string().optional().default("main").describe("Exact branch, tag, or ref to sync"),
 });
 
+const TeamPluginSyncSchema = z.object({
+  employee: z.string().min(1),
+  target: z.string().optional().default("local"),
+  install_missing: z.boolean().optional().default(false).describe("Install missing approved plugins from their pinned marketplace selector"),
+});
+
 
 // Type definitions
 type GPT5GenerateArgs = z.infer<typeof GPT5GenerateSchema>;
@@ -224,6 +231,7 @@ type TeamDispatchToolArgs = z.infer<typeof TeamDispatchSchema>;
 type TeamJobArgs = z.infer<typeof TeamJobSchema>;
 type TeamHarvestArgs = z.infer<typeof TeamHarvestSchema>;
 type TeamLibrarySyncArgs = z.infer<typeof TeamLibrarySyncSchema>;
+type TeamPluginSyncArgs = z.infer<typeof TeamPluginSyncSchema>;
 
 // Usage doc exposed as an MCP resource so connecting clients can fetch a
 // human-readable README through the protocol (in addition to tools/list, which
@@ -296,6 +304,8 @@ inputs; quarantined or revoked skills are rejected.
 - **team_status** / **team_result** inspect and collect direct or bridge jobs.
 - **team_library_sync** installs or updates the private versioned capability
   library on local or remote targets.
+- **team_plugin_sync** checks an employee's approved plugin requirements and
+  can install missing marketplace plugins explicitly.
 - **team_skill_harvest** asks an existing durable session to synthesize learned
   workflow into a quarantined candidate skill for human audit and promotion.
 
@@ -540,6 +550,11 @@ async function main() {
             name: "team_library_sync",
             description: "Clone or fast-forward the private capability library on a local or remote dispatch target, validate it, and return the exact commit.",
             inputSchema: zodToJsonSchema(TeamLibrarySyncSchema),
+          },
+          {
+            name: "team_plugin_sync",
+            description: "Check one employee's approved role/plugin requirements on its target and optionally install missing plugins from exact versioned marketplace selectors.",
+            inputSchema: zodToJsonSchema(TeamPluginSyncSchema),
           },
         ]
       };
@@ -895,6 +910,20 @@ async function main() {
               content: [{
                 type: "text",
                 text: JSON.stringify(syncCapabilityLibrary(args.target, args.ref), null, 2),
+              }],
+            };
+          }
+
+          case "team_plugin_sync": {
+            const args = TeamPluginSyncSchema.parse(request.params.arguments) as TeamPluginSyncArgs;
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify(
+                  syncEmployeePlugins(args.employee, args.target, args.install_missing),
+                  null,
+                  2,
+                ),
               }],
             };
           }
