@@ -15,6 +15,12 @@ const LIBRARY_REPO = process.env.GPT5_CAPABILITY_REPO || 'Realcryptoplato/team-a
 const LOCAL_LIBRARY_OVERRIDE = process.env.GPT5_CAPABILITY_LIBRARY;
 const LOCAL_DEVELOPMENT_LIBRARY = '/Users/greg/repos/team-agent-capabilities';
 const LOCAL_TEAM_JOBS = join(homedir(), '.gpt5mcp', 'team-jobs');
+const targetHomeCache = new Map<string, string>();
+const LIBRARY_SYNC_CACHE_MS = 120_000;
+const librarySyncCache = new Map<string, {
+  checkedAt: number;
+  value: { target: string; path: string; commit: string; changed: boolean };
+}>();
 
 export type EmployeeStatus = 'active' | 'archived';
 export type EmployeeSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';
@@ -203,8 +209,12 @@ function githubRepoSlug(value: string): string | undefined {
 
 function targetHome(target: Target): string {
   if (target.type === 'local') return homedir();
+  const cacheKey = target.host || target.name;
+  const cached = targetHomeCache.get(cacheKey);
+  if (cached) return cached;
   const home = targetExec(target, 'printf %s "$HOME"').trim();
   if (!home.startsWith('/')) throw new Error(`could not resolve home directory on ${target.host}`);
+  targetHomeCache.set(cacheKey, home);
   return home;
 }
 
@@ -252,10 +262,13 @@ function targetPathExists(target: Target, path: string, kind: 'file' | 'dir' = '
     }
   }
   const flag = kind === 'dir' ? '-d' : '-f';
-  return targetTry(target, `test ${flag} ${shellQuote(path)}`).ok;
+  return targetExec(
+    target,
+    `if test ${flag} ${shellQuote(path)}; then printf yes; else printf no; fi`,
+  ).trim() === 'yes';
 }
 
-export function syncCapabilityLibrary(targetSpec?: string, ref = 'main'): {
+export function syncCapabilityLibrary(targetSpec?: string, ref = 'main', force = false): {
   target: string;
   path: string;
   commit: string;
@@ -263,6 +276,7 @@ export function syncCapabilityLibrary(targetSpec?: string, ref = 'main'): {
 } {
   const target = resolveTarget(targetSpec);
   const root = libraryRoot(target);
+  const cacheKey = `${target.name}:${ref}`;
 
   // The local development checkout is authoritative while it exists. Do not
   // pull over an operator's uncommitted work.
@@ -271,22 +285,38 @@ export function syncCapabilityLibrary(targetSpec?: string, ref = 'main'): {
     return { target: target.name, path: root, commit, changed: false };
   }
 
-  const before = targetTry(target, `git -C ${shellQuote(root)} rev-parse HEAD`).out.trim();
-  if (targetPathExists(target, `${root}/.git`, 'dir')) {
-    targetExec(
-      target,
-      `git -C ${shellQuote(root)} fetch origin ${shellQuote(ref)} && ` +
-      `git -C ${shellQuote(root)} checkout ${shellQuote(ref)} && ` +
-      `git -C ${shellQuote(root)} pull --ff-only origin ${shellQuote(ref)}`,
-      120000,
-    );
-  } else {
-    targetExec(target, `mkdir -p ${shellQuote(`${targetHome(target)}/.gpt5mcp`)}`);
-    targetExec(target, `gh repo clone ${shellQuote(LIBRARY_REPO)} ${shellQuote(root)} -- --branch ${shellQuote(ref)}`, 120000);
+  const cached = librarySyncCache.get(cacheKey);
+  if (!force && cached && Date.now() - cached.checkedAt < LIBRARY_SYNC_CACHE_MS) {
+    return { ...cached.value, changed: false };
   }
-  const commit = targetExec(target, `git -C ${shellQuote(root)} rev-parse HEAD`).trim();
-  targetExec(target, `node ${shellQuote(`${root}/scripts/validate-library.mjs`)}`, 30000);
-  return { target: target.name, path: root, commit, changed: before !== commit };
+
+  const syncOutput = targetExec(
+    target,
+    [
+      'set -e',
+      `root=${shellQuote(root)}`,
+      `ref=${shellQuote(ref)}`,
+      'before=""',
+      'if test -d "$root/.git"; then',
+      '  before=$(git -C "$root" rev-parse HEAD 2>/dev/null || true)',
+      '  git -C "$root" fetch origin "$ref" >/dev/null',
+      '  git -C "$root" checkout "$ref" >/dev/null',
+      '  git -C "$root" pull --ff-only origin "$ref" >/dev/null',
+      'else',
+      `  mkdir -p ${shellQuote(`${targetHome(target)}/.gpt5mcp`)}`,
+      `  gh repo clone ${shellQuote(LIBRARY_REPO)} "$root" -- --branch "$ref" >/dev/null`,
+      'fi',
+      'commit=$(git -C "$root" rev-parse HEAD)',
+      'node "$root/scripts/validate-library.mjs" >/dev/null',
+      'printf "%s\\n%s\\n" "$before" "$commit"',
+    ].join('\n'),
+    120000,
+  );
+  const [before = '', commit = ''] = syncOutput.trimEnd().split('\n').slice(-2);
+  if (!commit) throw new Error(`capability library sync returned no commit on ${target.name}`);
+  const value = { target: target.name, path: root, commit, changed: before !== commit };
+  librarySyncCache.set(cacheKey, { checkedAt: Date.now(), value });
+  return value;
 }
 
 function readEmployee(target: Target, name: string): EmployeeManifest {
@@ -432,9 +462,107 @@ export function updateEmployee(args: UpdateArgs): EmployeeManifest {
   return next;
 }
 
+function remoteCapabilitySnapshot(target: Target, root: string): {
+  approved: { skills: ApprovedSkill[] };
+  plugins: { plugins: Array<{ id: string; status: string; source?: string; reason?: string }> };
+  template: any;
+  roles: Array<{ pack: any; template: any }>;
+  skillMarkdown: Record<string, string>;
+  employees: EmployeeManifest[];
+} {
+  const python = `
+import json
+from pathlib import Path
+
+root = Path(${JSON.stringify(root)})
+team_root = Path(${JSON.stringify(teamRoot(target))})
+
+def read_json(path):
+    return json.loads(path.read_text())
+
+approved = read_json(root / "registry" / "approved.json")
+plugins = read_json(root / "registry" / "plugins.json")
+template = read_json(root / "employees" / "templates" / "general.json")
+
+roles = []
+for path in sorted((root / "role-packs").glob("*.json")):
+    pack = read_json(path)
+    role_template_path = root / "employees" / "templates" / (str(pack["id"]) + ".json")
+    role_template = read_json(role_template_path) if role_template_path.is_file() else template
+    roles.append({"pack": pack, "template": role_template})
+
+skill_markdown = {}
+for skill in approved.get("skills", []):
+    path = root / skill["path"]
+    skill_markdown[skill["id"]] = path.read_text() if path.is_file() else ""
+
+employees = []
+employee_root = team_root / "employees"
+if employee_root.is_dir():
+    for path in sorted(employee_root.rglob("manifest.json")):
+        try:
+            employees.append(read_json(path))
+        except Exception:
+            pass
+
+print(json.dumps({
+    "approved": approved,
+    "plugins": plugins,
+    "template": template,
+    "roles": roles,
+    "skillMarkdown": skill_markdown,
+    "employees": employees,
+}))
+`.trim();
+  return JSON.parse(targetExec(target, `python3 -c ${shellQuote(python)}`, 60000));
+}
+
 export function getTeamCapabilityManifest(targetSpec?: string): TeamCapabilityManifest {
   const target = resolveTarget(targetSpec);
   const library = syncCapabilityLibrary(targetSpec);
+  if (target.type === 'ssh') {
+    const snapshot = remoteCapabilitySnapshot(target, library.path);
+    return {
+      schemaVersion: 1,
+      target: target.name,
+      library: { path: library.path, commit: library.commit },
+      defaults: {
+        model: snapshot.template.model,
+        reasoningEffort: snapshot.template.reasoningEffort,
+        sandbox: snapshot.template.sandbox,
+      },
+      workflow: [
+        'Call team_manifest on the intended target, then team_list to reuse an existing employee when one fits.',
+        'For a new employee, choose a role pack and an absolute workspace. Pass repo and optional branch to team_hire when the checkout does not exist; hiring clones it on the target.',
+        'Use team_plugin_sync with install_missing=true when the selected role has approved plugin requirements.',
+        'Call team_dispatch. Omit model/reasoning to use employee defaults, or override them for one assignment.',
+        'Poll team_status and collect team_result. Repeated dispatches resume the same durable employee thread.',
+        'Use team_skill_harvest to propose reusable learned workflow; harvested skills remain quarantined until audited.',
+        'Use team_update for durable changes. team_fire archives recoverably unless purge=true is explicitly requested.',
+      ],
+      rolePacks: snapshot.roles.map(({ pack, template }) => ({
+        id: pack.id,
+        description: pack.description || '',
+        skills: pack.skills || [],
+        plugins: pack.plugins || [],
+        defaults: {
+          model: template.model,
+          reasoningEffort: template.reasoningEffort,
+          sandbox: template.sandbox,
+        },
+      })).sort((a, b) => a.id.localeCompare(b.id)),
+      approvedSkills: snapshot.approved.skills.map((skill) => ({
+        id: skill.id,
+        version: skill.version,
+        trust: skill.trust,
+        description: skillDescription(snapshot.skillMarkdown[skill.id] || ''),
+      })),
+      approvedPlugins: snapshot.plugins.plugins
+        .filter((plugin) => plugin.status === 'approved')
+        .map(({ id, source, reason }) => ({ id, source, reason })),
+      employees: snapshot.employees.sort((a, b) => a.name.localeCompare(b.name)),
+    };
+  }
   const approved = jsonOnTarget<{ skills: ApprovedSkill[] }>(
     target,
     `${library.path}/registry/approved.json`,
@@ -447,8 +575,8 @@ export function getTeamCapabilityManifest(targetSpec?: string): TeamCapabilityMa
     ? readdirSync(join(library.path, 'role-packs'))
       .filter((name) => name.endsWith('.json'))
       .map((name) => `${library.path}/role-packs/${name}`)
-    : targetTry(target, `find ${shellQuote(`${library.path}/role-packs`)} -maxdepth 1 -name '*.json' -type f`)
-      .out.split('\n').map((value) => value.trim()).filter(Boolean);
+    : targetExec(target, `find ${shellQuote(`${library.path}/role-packs`)} -maxdepth 1 -name '*.json' -type f`)
+      .split('\n').map((value) => value.trim()).filter(Boolean);
   const rolePacks = roleFiles.map((path) => {
     const pack = jsonOnTarget<any>(target, path);
     const roleTemplatePath = `${library.path}/employees/templates/${pack.id}.json`;
@@ -545,7 +673,7 @@ export function listEmployees(targetSpec?: string, includeArchived = false): Emp
         }
       }
     } else {
-      const paths = targetTry(target, `find ${shellQuote(root)} -name manifest.json -type f 2>/dev/null`).out
+      const paths = targetExec(target, `find ${shellQuote(root)} -name manifest.json -type f 2>/dev/null || true`)
         .split('\n').map((value) => value.trim()).filter(Boolean);
       for (const path of paths) {
         try { manifests.push(jsonOnTarget<EmployeeManifest>(target, path)); } catch {}
@@ -578,6 +706,56 @@ function resolveEmployeeCapabilities(
   root: string,
   extraSkills: string[] = [],
 ): { skills: SkillRef[]; plugins: string[] } {
+  if (target.type === 'ssh') {
+    const input = {
+      rolePack: manifest.rolePack,
+      skills: manifest.skills,
+      plugins: manifest.plugins,
+      extraSkills,
+    };
+    const python = `
+import json
+from pathlib import Path
+
+root = Path(${JSON.stringify(root)})
+request = json.loads(${JSON.stringify(JSON.stringify(input))})
+approved = json.loads((root / "registry" / "approved.json").read_text())
+revoked = {
+    item["id"]
+    for item in json.loads((root / "registry" / "revoked.json").read_text()).get("skills", [])
+}
+pack_path = root / "role-packs" / (request["rolePack"] + ".json")
+if not pack_path.is_file():
+    raise RuntimeError("unknown role pack: " + request["rolePack"])
+pack = json.loads(pack_path.read_text())
+ids = list(dict.fromkeys(pack.get("skills", []) + request["skills"] + request["extraSkills"]))
+by_id = {skill["id"]: skill for skill in approved.get("skills", [])}
+skills = []
+for skill_id in ids:
+    if skill_id in revoked:
+        raise RuntimeError("skill is revoked: " + skill_id)
+    if skill_id not in by_id:
+        raise RuntimeError("skill is not approved: " + skill_id)
+    skill = by_id[skill_id]
+    path = root / skill["path"]
+    if not path.is_file():
+        raise RuntimeError("approved skill file is missing: " + str(path))
+    skills.append({"name": skill_id, "path": str(path), "version": skill.get("version")})
+
+plugins = list(dict.fromkeys(pack.get("plugins", []) + request["plugins"]))
+approved_plugins = {
+    plugin["id"]
+    for plugin in json.loads((root / "registry" / "plugins.json").read_text()).get("plugins", [])
+    if plugin.get("status") == "approved"
+}
+for plugin in plugins:
+    if plugin not in approved_plugins:
+        raise RuntimeError("plugin is not approved: " + plugin)
+
+print(json.dumps({"skills": skills, "plugins": plugins}))
+`.trim();
+    return JSON.parse(targetExec(target, `python3 -c ${shellQuote(python)}`, 60000));
+  }
   const approved = jsonOnTarget<{ skills: ApprovedSkill[] }>(target, `${root}/registry/approved.json`);
   const revoked = new Set(
     jsonOnTarget<{ skills: Array<{ id: string }> }>(target, `${root}/registry/revoked.json`)
@@ -647,8 +825,25 @@ export function syncEmployeePlugins(
 
 function employeePrompt(target: Target, manifest: EmployeeManifest, prompt: string, skills: SkillRef[]): string {
   const dir = employeeDir(target, manifest.slug);
-  const charter = targetReadFile(target, `${dir}/CHARTER.md`).trim();
-  const memory = targetReadFile(target, `${dir}/MEMORY.md`).trim();
+  let charter = '';
+  let memory = '';
+  if (target.type === 'ssh') {
+    const python = `
+import json
+from pathlib import Path
+directory = Path(${JSON.stringify(dir)})
+def read(name):
+    path = directory / name
+    return path.read_text() if path.is_file() else ""
+print(json.dumps({"charter": read("CHARTER.md"), "memory": read("MEMORY.md")}))
+`.trim();
+    const files = JSON.parse(targetExec(target, `python3 -c ${shellQuote(python)}`, 60000));
+    charter = String(files.charter || '').trim();
+    memory = String(files.memory || '').trim();
+  } else {
+    charter = targetReadFile(target, `${dir}/CHARTER.md`).trim();
+    memory = targetReadFile(target, `${dir}/MEMORY.md`).trim();
+  }
   return [
     `You are ${manifest.name}, a managed long-lived team employee.`,
     `Assigned workspace: ${manifest.workspace}`,

@@ -4,7 +4,7 @@
 // remote job dir over SSH to poll, steer, and collect.
 
 import { execFileSync, spawn, spawnSync } from 'child_process';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -41,7 +41,17 @@ export function resolveTarget(spec?: string): Target {
   throw new Error(`unknown target "${spec}" (not in targets.json and not user@host)`);
 }
 
-const SSH_OPTS = ['-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes'];
+const SSH_CONTROL_DIR = join(homedir(), '.gpt5mcp', 'ssh-control');
+mkdirSync(SSH_CONTROL_DIR, { recursive: true, mode: 0o700 });
+
+const SSH_OPTS = [
+  '-o', 'ConnectTimeout=10',
+  '-o', 'StrictHostKeyChecking=accept-new',
+  '-o', 'BatchMode=yes',
+  '-o', 'ControlMaster=auto',
+  '-o', 'ControlPersist=120',
+  '-o', `ControlPath=${join(SSH_CONTROL_DIR, 'mux-%C')}`,
+];
 const LOCAL_COMMAND_TIMEOUT_MS = 20_000;
 const REMOTE_COMMAND_TIMEOUT_MS = 60_000;
 
@@ -98,8 +108,7 @@ export function targetReadFile(t: Target, path: string): string {
   if (t.type === 'local') {
     try { return readFileSync(path, 'utf8'); } catch { return ''; }
   }
-  const r = targetTry(t, `cat '${path.replace(/'/g, `'\\''`)}' 2>/dev/null`);
-  return r.ok ? r.out : '';
+  return targetExec(t, `cat '${path.replace(/'/g, `'\\''`)}' 2>/dev/null || true`);
 }
 
 /** Write a UTF-8 file on the target, creating its parent directory. */
