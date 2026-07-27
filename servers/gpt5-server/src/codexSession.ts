@@ -80,7 +80,16 @@ function readMeta(id: string): SessMeta | null {
     ? (existsSync(fileIn(dir, 'meta.json')) ? readFileSync(fileIn(dir, 'meta.json'), 'utf8') : '')
     : targetReadFile(target, fileIn(dir, 'meta.json'));
   if (!raw) return null;
-  try { return JSON.parse(raw); } catch { return null; }
+  try {
+    const meta = JSON.parse(raw) as SessMeta;
+    if (target.type === 'ssh' && !meta.pid) {
+      const pid = Number(targetReadFile(target, fileIn(dir, 'pid.txt')).trim());
+      if (Number.isFinite(pid) && pid > 0) meta.pid = pid;
+    }
+    return meta;
+  } catch {
+    return null;
+  }
 }
 
 let sessCounter = 0;
@@ -340,7 +349,9 @@ export function startSession(opts: StartOpts): SessMeta {
   const pidOut = targetExec(target, launch).trim();
   const pid = parseInt(pidOut.split('\n').pop() || '', 10);
   meta.pid = Number.isFinite(pid) ? pid : undefined;
-  writeRemoteFile(target, `${remoteDir}/meta.json`, JSON.stringify(meta, null, 2));
+  // Keep the pid separate: rewriting meta.json here races the driver, which
+  // may already have persisted its threadId/turnId/completion state.
+  writeRemoteFile(target, `${remoteDir}/pid.txt`, meta.pid ? `${meta.pid}\n` : '');
 
   // 4) local stub points at the remote (absolute remote path)
   writeFileSync(join(stubDir, 'target.json'), JSON.stringify({ host, remoteDir }));
