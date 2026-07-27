@@ -3,7 +3,7 @@
 // running after the laptop closes / Claude quits; the local tools reach the
 // remote job dir over SSH to poll, steer, and collect.
 
-import { execFileSync, spawn } from 'child_process';
+import { execFileSync, spawn, spawnSync } from 'child_process';
 import { readFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -48,7 +48,37 @@ export function targetExec(t: Target, cmd: string, timeoutMs = 20000): string {
   if (t.type === 'local') {
     return execFileSync('/bin/bash', ['-c', cmd], { encoding: 'utf8', timeout: timeoutMs });
   }
-  return execFileSync('ssh', [...SSH_OPTS, t.host!, cmd], { encoding: 'utf8', timeout: timeoutMs });
+  // Some managed SSH hosts deliberately normalize the SSH process exit status
+  // to zero. Carry the real remote command status back in stdout so existence
+  // checks and failed deploy commands cannot be mistaken for success.
+  const marker = '__GPT5_MCP_REMOTE_EXIT__=';
+  const wrapped = `{ ${cmd}; }; _gpt5_mcp_remote_exit=$?; ` +
+    `printf '\\n${marker}%s\\n' "$_gpt5_mcp_remote_exit"`;
+  const result = spawnSync('ssh', [...SSH_OPTS, t.host!, wrapped], {
+    encoding: 'utf8',
+    timeout: timeoutMs,
+  });
+  if (result.error) throw result.error;
+  const stdout = result.stdout || '';
+  const match = new RegExp(`\\n${marker}(\\d+)\\n?$`).exec(stdout);
+  if (!match) {
+    const error: any = new Error(
+      `remote command on ${t.host} returned no status marker: ${(result.stderr || '').trim().slice(-500)}`,
+    );
+    error.stdout = stdout;
+    throw error;
+  }
+  const output = stdout.slice(0, match.index);
+  const status = Number(match[1]);
+  if (status !== 0) {
+    const detail = [output.trim(), (result.stderr || '').trim()].filter(Boolean).join('\n');
+    const error: any = new Error(
+      `remote command failed on ${t.host} (exit ${status})${detail ? `: ${detail.slice(-1000)}` : ''}`,
+    );
+    error.stdout = detail;
+    throw error;
+  }
+  return output;
 }
 
 /** Try-exec: returns {ok, out} instead of throwing (for polling reads). */
