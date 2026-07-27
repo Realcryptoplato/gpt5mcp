@@ -37,6 +37,11 @@ The bridge queues the task into the bot's existing durable Codex thread and can
 send the final response both to the MCP caller's job ledger and to Telegram.
 The token remains on the target host and is never returned by an MCP tool.
 
+`team_update` sets an employee's default `model` and `reasoning_effort`.
+`team_dispatch` can override either for one assignment. Direct and
+Telegram-backed MCP jobs both honor the effective employee/job configuration;
+ordinary Telegram messages continue to use the bridge process defaults.
+
 ```text
 team_library_sync target=mini
 team_hire name=Sophia target=mini workspace=/absolute/path role_pack=ios-engineer bridge_port=8111

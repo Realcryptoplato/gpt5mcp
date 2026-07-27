@@ -104,7 +104,7 @@ export interface StartOpts {
   cwd?: string;
   model?: string;
   label?: string;
-  effort?: 'low' | 'medium' | 'high' | 'xhigh';
+  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
   target?: string;   // local | mini | user@host
   repo?: string;     // GitHub slug owner/name (remote: how to get the code)
