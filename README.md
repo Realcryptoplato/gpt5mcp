@@ -9,6 +9,45 @@
 
 ---
 
+## Team employees and capability library
+
+This fork can manage named, long-lived Codex employees on the laptop, a remote
+target such as `mini`, or an existing Telegram-backed Codex session.
+
+- `team_hire`, `team_update`, `team_list`, `team_get`, and `team_fire` manage
+  employee manifests, assigned workspaces, role packs, skills, and durable
+  thread ids. Firing archives by default; permanent deletion requires
+  `purge=true`.
+- `team_dispatch`, `team_status`, and `team_result` resume the employee's Codex
+  thread and attach approved skills as native app-server skill inputs.
+- `team_library_sync` installs or updates the private, versioned capability
+  library on a target.
+- `team_skill_harvest` asks an existing employee—including a Telegram-backed
+  employee—to synthesize its learned workflow into a quarantined candidate
+  skill for review. It never auto-promotes generated knowledge.
+
+Employees are target-scoped and have an explicit absolute workspace. Role packs
+resolve only skills listed in the library's approved registry; revoked and
+quarantined skills fail closed.
+
+Telegram employees use a loopback-only, token-authenticated bridge ingress.
+The bridge queues the task into the bot's existing durable Codex thread and can
+send the final response both to the MCP caller's job ledger and to Telegram.
+The token remains on the target host and is never returned by an MCP tool.
+
+```text
+team_library_sync target=mini
+team_hire name=Sophia target=mini workspace=/absolute/path role_pack=ios-engineer bridge_port=8111
+team_dispatch employee=Sophia target=mini prompt="Review the current SwiftUI architecture"
+team_status job_id=...
+team_result job_id=...
+```
+
+After rebuilding, fully restart MCP clients such as Codex Desktop or Claude
+Desktop/Code so they reconnect and refresh `tools/list`.
+
+---
+
 A Model Context Protocol (MCP) server that provides seamless integration with OpenAI's GPT-5 API through Claude Code. This server enables you to leverage GPT-5's advanced capabilities directly within your Claude Code workflows.
 
 ## 🚀 Features

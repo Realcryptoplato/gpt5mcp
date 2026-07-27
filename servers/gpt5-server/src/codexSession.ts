@@ -49,6 +49,9 @@ export interface SessMeta {
   host?: string;     // ssh host if remote
   repo?: string;
   branch?: string;
+  employee?: string;
+  resumedThreadId?: string;
+  skills?: Array<{ name: string; path: string; version?: string }>;
   configNote?: string;  // set if the codex config was auto-sanitized before launch
 }
 
@@ -98,6 +101,9 @@ export interface StartOpts {
   repo?: string;     // GitHub slug owner/name (remote: how to get the code)
   branch?: string;   // branch to work on (default main)
   requireCodexMatch?: boolean;  // remote: require local/remote codex major.minor match (default true)
+  threadId?: string;   // resume this durable Codex thread instead of starting a new one
+  skills?: Array<{ name: string; path: string; version?: string }>;
+  employee?: string;
 }
 
 /** Parse "codex-cli 0.142.0" -> "0.142.0". */
@@ -118,10 +124,14 @@ function localCodexVersion(): string | null {
 function localCodexBinary(): string {
   const candidates = [
     process.env.GPT5_CODEX_CLI_PATH,
-    join(homedir(), '.nvm', 'versions', 'node', 'v20.19.1', 'bin', 'codex'),
-    '/Applications/Codex.app/Contents/Resources/codex',
+    // Desktop bundles the newest app-server build and shares the operator's
+    // authenticated Codex state. Prefer it over old npm/Homebrew installs.
+    '/Applications/ChatGPT.app/Contents/Resources/codex',
+    join(homedir(), '.local', 'bin', 'codex'),
     process.env.CODEX_CLI_PATH,
     'codex',
+    join(homedir(), '.nvm', 'versions', 'node', 'v20.19.1', 'bin', 'codex'),
+    '/opt/homebrew/bin/codex',
   ].filter((p): p is string => Boolean(p));
   for (const candidate of candidates) {
     try {
@@ -224,11 +234,13 @@ export function startSession(opts: StartOpts): SessMeta {
     const codexBin = localCodexBinary();
     const meta: SessMeta = {
       id, cwd, model: model || '(codex CLI default)', state: 'starting', startedAt, label: opts.label, target: 'local',
+      employee: opts.employee, resumedThreadId: opts.threadId, skills: opts.skills,
       ...(san.changed ? { configNote: san.report } : {}),
     };
     writeFileSync(join(dir, 'meta.json'), JSON.stringify(meta, null, 2));
     writeFileSync(join(dir, 'control.jsonl'), '');
     writeFileSync(join(dir, 'events.jsonl'), '');
+    writeFileSync(join(dir, 'skills.json'), JSON.stringify(opts.skills || [], null, 2));
     writeFileSync(join(dir, 'target.json'), JSON.stringify({ host: null, remoteDir: null }));
     const log = openSync(join(dir, 'driver.log'), 'a');
     const child = spawn(process.execPath, [
@@ -236,6 +248,8 @@ export function startSession(opts: StartOpts): SessMeta {
       ...(model ? ['--model', model] : []),
       '--sandbox', opts.sandbox || 'danger-full-access',
       ...(opts.effort ? ['--effort', opts.effort] : []),
+      ...(opts.threadId ? ['--thread-id', opts.threadId] : []),
+      '--skills-file', join(dir, 'skills.json'),
     ], { cwd, detached: true, stdio: ['ignore', log, log], env: { ...process.env, CODEX_CLI_PATH: codexBin, CODEX_SESSION_PROMPT: opts.prompt } });
     meta.pid = child.pid;
     writeFileSync(join(dir, 'meta.json'), JSON.stringify(meta, null, 2));
@@ -265,7 +279,10 @@ export function startSession(opts: StartOpts): SessMeta {
   // Resolve absolute paths ON THE REMOTE once, so $HOME/~ never leak into
   // single-quoted contexts where they wouldn't expand.
   const remoteHome = targetExec(target, 'echo "$HOME"').trim();
-  const workRootRaw = target.workRoot || '~/dev';
+  // A direct remote job without repo bootstrap may explicitly target a folder.
+  // Repo jobs continue to interpret the target preset's workRoot as their clone
+  // root so the existing repo bootstrap contract remains unchanged.
+  const workRootRaw = (!opts.repo && opts.cwd) ? opts.cwd : (target.workRoot || '~/dev');
   const workRoot = workRootRaw.replace(/^~(?=\/|$)/, remoteHome);
   // Ensure the work root exists NOW so the app-server has a valid cwd. (The repo
   // subdir may not exist yet — Codex clones it during the turn — so we start the
@@ -285,6 +302,7 @@ export function startSession(opts: StartOpts): SessMeta {
   const meta: SessMeta = {
     id, cwd: reportedCwd, model: model || '(codex CLI default)', state: 'starting', startedAt, label: opts.label,
     target: opts.target, host, repo: opts.repo, branch,
+    employee: opts.employee, resumedThreadId: opts.threadId, skills: opts.skills,
     ...(remoteSan.changed ? { configNote: remoteSan.report } : {}),
   };
 
@@ -296,6 +314,7 @@ export function startSession(opts: StartOpts): SessMeta {
   writeRemoteFile(target, `${remoteDir}/control.jsonl`, '');
   writeRemoteFile(target, `${remoteDir}/events.jsonl`, '');
   writeRemoteFile(target, `${remoteDir}/prompt.txt`, fullPrompt);
+  writeRemoteFile(target, `${remoteDir}/skills.json`, JSON.stringify(opts.skills || [], null, 2));
 
   // 2) copy the driver.cjs to the remote (small file)
   const driverSrc = readFileSync(DRIVER, 'utf8');
@@ -315,6 +334,8 @@ export function startSession(opts: StartOpts): SessMeta {
     (model ? `--model ${model} ` : '') +
     `--sandbox ${opts.sandbox || 'danger-full-access'} ` +
     (opts.effort ? `--effort ${opts.effort} ` : '') +
+    (opts.threadId ? `--thread-id '${opts.threadId}' ` : '') +
+    `--skills-file ${remoteDir}/skills.json ` +
     `>> ${remoteDir}/driver.log 2>&1 & echo $!`;
   const pidOut = targetExec(target, launch).trim();
   const pid = parseInt(pidOut.split('\n').pop() || '', 10);

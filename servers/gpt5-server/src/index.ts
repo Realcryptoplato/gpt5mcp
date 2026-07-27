@@ -19,6 +19,10 @@ import {
   startSession, steerSession, interruptSession, getSession, listSessions,
   sessionEvents, sessionFinalMessage, sessionChangedFiles,
 } from './codexSession.js';
+import {
+  dispatchEmployee, fireEmployee, getEmployee, harvestEmployeeKnowledge, hireEmployee,
+  listEmployees, syncCapabilityLibrary, teamJobResult, teamJobStatus, updateEmployee,
+} from './team.js';
 
 // Initialize environment from parent directory
 import { dirname } from 'path';
@@ -122,6 +126,84 @@ const CodexInterruptSchema = z.object({
   job_id: z.string().describe("Job id to interrupt (sends turn/interrupt; keeps the thread)")
 });
 
+const TeamHireSchema = z.object({
+  name: z.string().min(1).describe("Stable employee name, for example Sophia or a new hire such as Olivia"),
+  target: z.string().optional().default("local").describe("Dispatch target that owns the employee state: local, mini, a preset, or user@host"),
+  workspace: z.string().describe("Absolute workspace folder on the target"),
+  role_pack: z.string().optional().default("general").describe("Role pack from the capability library"),
+  skills: z.array(z.string()).optional().default([]).describe("Additional approved skill ids"),
+  plugins: z.array(z.string()).optional().default([]).describe("Additional plugin ids recorded as requirements"),
+  charter: z.string().optional().describe("Employee-specific role and boundaries"),
+  model: z.string().optional().describe("Codex model override; omit for role/default configuration"),
+  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  bridge_port: z.number().int().min(1).max(65535).optional().describe("Existing Telegram bridge port. When set, team_dispatch queues into that bridge's durable session."),
+  telegram_bot: z.string().optional().describe("Safe bot username metadata, for example @MacMiniCodexIOS_bot"),
+  notify_telegram: z.boolean().optional().default(true).describe("For bridge employees, also deliver progress/results to Telegram"),
+});
+
+const TeamUpdateSchema = z.object({
+  name: z.string().min(1),
+  target: z.string().optional().default("local"),
+  workspace: z.string().optional(),
+  role_pack: z.string().optional(),
+  skills: z.array(z.string()).optional(),
+  plugins: z.array(z.string()).optional(),
+  charter: z.string().optional(),
+  model: z.string().optional(),
+  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  bridge_port: z.number().int().min(1).max(65535).nullable().optional().describe("Set a bridge port, or null to remove the bridge binding"),
+  telegram_bot: z.string().optional(),
+  notify_telegram: z.boolean().optional(),
+});
+
+const TeamEmployeeSchema = z.object({
+  name: z.string().min(1),
+  target: z.string().optional().default("local"),
+});
+
+const TeamListSchema = z.object({
+  target: z.string().optional().default("local"),
+  include_archived: z.boolean().optional().default(false),
+});
+
+const TeamFireSchema = z.object({
+  name: z.string().min(1),
+  target: z.string().optional().default("local"),
+  purge: z.boolean().optional().default(false).describe("False archives recoverably. True permanently deletes this employee's local team state."),
+});
+
+const TeamDispatchSchema = z.object({
+  employee: z.string().min(1),
+  target: z.string().optional().default("local"),
+  prompt: z.string().min(1),
+  model: z.string().optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional(),
+  label: z.string().optional(),
+  sync_library: z.boolean().optional().default(true),
+  extra_skills: z.array(z.string()).optional().default([]).describe("Additional approved skills for this one assignment"),
+});
+
+const TeamJobSchema = z.object({
+  job_id: z.string().min(1).describe("Team job id returned by team_dispatch or team_skill_harvest"),
+  events: z.number().int().min(1).max(200).optional().default(40),
+});
+
+const TeamHarvestSchema = z.object({
+  employee: z.string().min(1).describe("Managed employee or existing Telegram-backed employee whose durable session should synthesize the knowledge"),
+  target: z.string().optional().default("local"),
+  skill_name: z.string().min(1).describe("Proposed lowercase skill name; normalized to hyphen-case"),
+  topic: z.string().min(1).describe("What durable workflows or learned behavior to extract"),
+  label: z.string().optional(),
+});
+
+const TeamLibrarySyncSchema = z.object({
+  target: z.string().optional().default("local"),
+  ref: z.string().optional().default("main").describe("Exact branch, tag, or ref to sync"),
+});
+
 
 // Type definitions
 type GPT5GenerateArgs = z.infer<typeof GPT5GenerateSchema>;
@@ -133,6 +215,15 @@ type CodexStatusArgs = z.infer<typeof CodexStatusSchema>;
 type CodexResultArgs = z.infer<typeof CodexResultSchema>;
 type CodexSteerArgs = z.infer<typeof CodexSteerSchema>;
 type CodexInterruptArgs = z.infer<typeof CodexInterruptSchema>;
+type TeamHireArgs = z.infer<typeof TeamHireSchema>;
+type TeamUpdateArgs = z.infer<typeof TeamUpdateSchema>;
+type TeamEmployeeArgs = z.infer<typeof TeamEmployeeSchema>;
+type TeamListArgs = z.infer<typeof TeamListSchema>;
+type TeamFireArgs = z.infer<typeof TeamFireSchema>;
+type TeamDispatchToolArgs = z.infer<typeof TeamDispatchSchema>;
+type TeamJobArgs = z.infer<typeof TeamJobSchema>;
+type TeamHarvestArgs = z.infer<typeof TeamHarvestSchema>;
+type TeamLibrarySyncArgs = z.infer<typeof TeamLibrarySyncSchema>;
 
 // Usage doc exposed as an MCP resource so connecting clients can fetch a
 // human-readable README through the protocol (in addition to tools/list, which
@@ -192,6 +283,21 @@ Pattern: dispatch -> watch on your own schedule -> steer if it's drifting -> col
   Cloudflare Pages/Workers, or vendor-infra queue work. Defaults to read-only/preflight; set
   allow_mutations=true for actual uploads/deploys. It never allows final App Store submission unless
   allow_app_store_submit=true. Secret values must stay in remote env files/dashboard secrets, never prompts.
+
+## Managed team employees
+Employees are target-scoped, pinned to an absolute workspace, and resume their
+durable Codex thread. Approved skills are attached as native app-server skill
+inputs; quarantined or revoked skills are rejected.
+- **team_hire** / **team_update** / **team_list** / **team_get** / **team_fire**
+  manage named employees. Fire archives by default; purge is explicit.
+- **team_dispatch** starts a non-blocking employee job. Existing Telegram
+  employees queue through their loopback-only authenticated bridge and can
+  return the result to both the MCP job ledger and Telegram.
+- **team_status** / **team_result** inspect and collect direct or bridge jobs.
+- **team_library_sync** installs or updates the private versioned capability
+  library on local or remote targets.
+- **team_skill_harvest** asks an existing durable session to synthesize learned
+  workflow into a quarantined candidate skill for human audit and promotion.
 
 ## Notes
 - Image gen is agentic (the model writes the file); allow up to ~4 min.
@@ -384,6 +490,56 @@ async function main() {
             name: "codex_interrupt",
             description: "Interrupt a running Codex job's turn (turn/interrupt) — stop the current work without killing the thread.",
             inputSchema: zodToJsonSchema(CodexInterruptSchema),
+          },
+          {
+            name: "team_hire",
+            description: "Create a durable named employee on a local or remote target with an assigned workspace, charter, role pack, approved skills, memory file, and resumable Codex thread. Set bridge_port to bind an existing Telegram-backed session.",
+            inputSchema: zodToJsonSchema(TeamHireSchema),
+          },
+          {
+            name: "team_update",
+            description: "Edit a managed employee's workspace, role pack, skills, plugins, charter, model, sandbox, or Telegram bridge binding.",
+            inputSchema: zodToJsonSchema(TeamUpdateSchema),
+          },
+          {
+            name: "team_list",
+            description: "List managed employees on a dispatch target, including their role, workspace, bridge binding, and current durable thread id.",
+            inputSchema: zodToJsonSchema(TeamListSchema),
+          },
+          {
+            name: "team_get",
+            description: "Inspect one employee and resolve its exact approved skills, plugin requirements, and capability-library commit.",
+            inputSchema: zodToJsonSchema(TeamEmployeeSchema),
+          },
+          {
+            name: "team_fire",
+            description: "Remove an employee from active duty. Archives recoverably by default; purge=true permanently removes only that employee's ~/.gpt5mcp/team state.",
+            inputSchema: zodToJsonSchema(TeamFireSchema),
+          },
+          {
+            name: "team_dispatch",
+            description: "Dispatch work to a named employee. Ordinary employees resume one durable Codex thread with explicit skill input items; Telegram-bound employees queue through their bridge so the same session runs once and the result is visible both here and in Telegram.",
+            inputSchema: zodToJsonSchema(TeamDispatchSchema),
+          },
+          {
+            name: "team_status",
+            description: "Check a team job from team_dispatch or team_skill_harvest, whether it is a direct Codex employee or a Telegram bridge employee.",
+            inputSchema: zodToJsonSchema(TeamJobSchema),
+          },
+          {
+            name: "team_result",
+            description: "Collect the result of a team job, including employee, skill receipt metadata, thread id, changed files, and final message.",
+            inputSchema: zodToJsonSchema(TeamJobSchema),
+          },
+          {
+            name: "team_skill_harvest",
+            description: "Ask an employee's existing durable session to synthesize learned behavior into a candidate SKILL.md using the approved harvest-session-knowledge skill. The candidate is never auto-approved.",
+            inputSchema: zodToJsonSchema(TeamHarvestSchema),
+          },
+          {
+            name: "team_library_sync",
+            description: "Clone or fast-forward the private capability library on a local or remote dispatch target, validate it, and return the exact commit.",
+            inputSchema: zodToJsonSchema(TeamLibrarySyncSchema),
           },
         ]
       };
@@ -586,6 +742,161 @@ async function main() {
             const args = CodexInterruptSchema.parse(request.params.arguments) as CodexInterruptArgs;
             const r = interruptSession(args.job_id);
             return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }], ...(r.ok ? {} : { isError: true }) };
+          }
+
+          case "team_hire": {
+            const args = TeamHireSchema.parse(request.params.arguments) as TeamHireArgs;
+            const employee = hireEmployee({
+              name: args.name,
+              target: args.target,
+              workspace: args.workspace,
+              rolePack: args.role_pack,
+              skills: args.skills,
+              plugins: args.plugins,
+              charter: args.charter,
+              model: args.model,
+              reasoningEffort: args.reasoning_effort,
+              sandbox: args.sandbox,
+              bridgePort: args.bridge_port,
+              botUsername: args.telegram_bot,
+              notifyTelegram: args.notify_telegram,
+            });
+            return { content: [{ type: "text", text: JSON.stringify(employee, null, 2) }] };
+          }
+
+          case "team_update": {
+            const args = TeamUpdateSchema.parse(request.params.arguments) as TeamUpdateArgs;
+            const employee = updateEmployee({
+              name: args.name,
+              target: args.target,
+              workspace: args.workspace,
+              rolePack: args.role_pack,
+              skills: args.skills,
+              plugins: args.plugins,
+              charter: args.charter,
+              model: args.model,
+              reasoningEffort: args.reasoning_effort,
+              sandbox: args.sandbox,
+              bridgePort: args.bridge_port,
+              botUsername: args.telegram_bot,
+              notifyTelegram: args.notify_telegram,
+            });
+            return { content: [{ type: "text", text: JSON.stringify(employee, null, 2) }] };
+          }
+
+          case "team_list": {
+            const args = TeamListSchema.parse(request.params.arguments) as TeamListArgs;
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify(listEmployees(args.target, args.include_archived), null, 2),
+              }],
+            };
+          }
+
+          case "team_get": {
+            const args = TeamEmployeeSchema.parse(request.params.arguments) as TeamEmployeeArgs;
+            return {
+              content: [{ type: "text", text: JSON.stringify(getEmployee(args.name, args.target), null, 2) }],
+            };
+          }
+
+          case "team_fire": {
+            const args = TeamFireSchema.parse(request.params.arguments) as TeamFireArgs;
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify(fireEmployee(args.name, args.target, args.purge), null, 2),
+              }],
+            };
+          }
+
+          case "team_dispatch": {
+            const args = TeamDispatchSchema.parse(request.params.arguments) as TeamDispatchToolArgs;
+            const result = dispatchEmployee({
+              employee: args.employee,
+              target: args.target,
+              prompt: args.prompt,
+              model: args.model,
+              sandbox: args.sandbox,
+              reasoningEffort: args.reasoning_effort,
+              label: args.label,
+              syncLibrary: args.sync_library,
+              extraSkills: args.extra_skills,
+            });
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  team_job_id: result.job.id,
+                  state: result.session?.state || "queued",
+                  employee: result.job.employee,
+                  target: result.job.target,
+                  transport: result.job.kind,
+                  codex_job_id: result.session?.id,
+                  skills: result.job.skills,
+                  plugins: result.plugins,
+                  libraryCommit: result.job.libraryCommit,
+                  note: result.job.kind === "bridge"
+                    ? "Queued through the employee's Telegram bridge. Poll team_status; the final result is also delivered to Telegram."
+                    : "Dispatched to the employee's durable Codex thread. Poll team_status and collect with team_result.",
+                }, null, 2),
+              }],
+            };
+          }
+
+          case "team_status": {
+            const args = TeamJobSchema.parse(request.params.arguments) as TeamJobArgs;
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify(teamJobStatus(args.job_id, args.events), null, 2),
+              }],
+            };
+          }
+
+          case "team_result": {
+            const args = TeamJobSchema.parse(request.params.arguments) as TeamJobArgs;
+            const result = teamJobResult(args.job_id);
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+              ...(result.state === "failed" ? { isError: true } : {}),
+            };
+          }
+
+          case "team_skill_harvest": {
+            const args = TeamHarvestSchema.parse(request.params.arguments) as TeamHarvestArgs;
+            const result = harvestEmployeeKnowledge({
+              employee: args.employee,
+              target: args.target,
+              skillName: args.skill_name,
+              topic: args.topic,
+              label: args.label,
+            });
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  team_job_id: result.job.id,
+                  state: result.session?.state || "queued",
+                  employee: result.job.employee,
+                  target: result.job.target,
+                  transport: result.job.kind,
+                  candidateSkill: result.job.harvest?.skillName,
+                  note: "The employee is producing a quarantined candidate only. Poll team_status and collect with team_result; review before promotion.",
+                }, null, 2),
+              }],
+            };
+          }
+
+          case "team_library_sync": {
+            const args = TeamLibrarySyncSchema.parse(request.params.arguments) as TeamLibrarySyncArgs;
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify(syncCapabilityLibrary(args.target, args.ref), null, 2),
+              }],
+            };
           }
 
           default:
