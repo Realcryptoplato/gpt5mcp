@@ -77,6 +77,33 @@ const CodexDispatchSchema = z.object({
   label: z.string().optional().describe("Short human label for the job")
 });
 
+const CodexDeploySchema = z.object({
+  task: z.string().describe("The deployment or vendor-infra task. Do not include secret values."),
+  deploy_type: z.enum([
+    'appstore_status',
+    'appstore_testflight',
+    'cloudflare_pages',
+    'cloudflare_worker',
+    'vendor_infra',
+    'custom',
+  ]).describe("Deployment profile/guardrail set to apply."),
+  target: z.string().optional().default("mini").describe("Where to run the deployment worker. Defaults to the Mac Mini target."),
+  repo_path: z.string().optional().describe("Absolute path to an existing repo/worktree on the target host. Preferred for deploys."),
+  repo: z.string().optional().describe("GitHub slug owner/name if the worker must clone/fetch it itself. For deploys, repo_path is preferred."),
+  branch: z.string().optional().default("main").describe("Branch to checkout/fetch if repo is supplied and repo_path is not."),
+  allow_mutations: z.boolean().optional().default(false).describe("If false, the worker must stop after read-only status/preflight/dry-run checks. Set true for actual deploy/upload/vendor mutations."),
+  allow_app_store_submit: z.boolean().optional().default(false).describe("If false, never press/call final App Store submission/resubmission. Owner approval is required."),
+  allow_browser_dashboard: z.boolean().optional().default(false).describe("If false, do not use Chrome/vendor dashboards; stop and report if browser login/dashboard work is required."),
+  queue_entry: z.string().optional().describe("Optional vendor handoff queue entry id/app name/line reference to claim and update."),
+  health_check_urls: z.array(z.string()).optional().default([]).describe("Public URLs to smoke-check after a scoped mutation."),
+  asc_key_path: z.string().optional().default("/Users/ellaai/.codex/secrets/app-store-connect/AuthKey_J77JD8RJXF.p8").describe("Remote App Store Connect API private key path. Path only; never print contents."),
+  env_candidate_path: z.string().optional().default("/Users/ellaai/.hermes/profiles/plato-eval/.env.cloudflare-candidate").describe("Remote candidate env file path. Source selectively; never print values."),
+  model: z.string().optional().describe("Codex model. Omit to use the codex CLI's own configured default model — never hardcoded here."),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().default('danger-full-access').describe("Execution sandbox. Deploy preflight may need commands/network; actual deploys need mutations explicitly allowed."),
+  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional().default('high').describe("Codex reasoning effort"),
+  label: z.string().optional().describe("Short human label for the deploy job")
+});
+
 const CodexStatusSchema = z.object({
   job_id: z.string().optional().describe("Job id to check (the value returned by codex_dispatch). Omit to list ALL jobs."),
   events: z.number().optional().default(40).describe("How many recent events to return (assistant text + turn lifecycle = what Codex is doing now)")
@@ -101,6 +128,7 @@ type GPT5GenerateArgs = z.infer<typeof GPT5GenerateSchema>;
 type GPT5ImageArgs = z.infer<typeof GPT5ImageSchema>;
 type GPT5MessagesArgs = z.infer<typeof GPT5MessagesSchema>;
 type CodexDispatchArgs = z.infer<typeof CodexDispatchSchema>;
+type CodexDeployArgs = z.infer<typeof CodexDeploySchema>;
 type CodexStatusArgs = z.infer<typeof CodexStatusSchema>;
 type CodexResultArgs = z.infer<typeof CodexResultSchema>;
 type CodexSteerArgs = z.infer<typeof CodexSteerSchema>;
@@ -158,12 +186,103 @@ non-blocking; you watch, course-correct, and collect by the same job_id.
 - **codex_result** { job_id } -> { state, filesChanged, finalMessage } once finished.
 Jobs persist under ~/.gpt5mcp/codex-sessions/ and survive a restart.
 Pattern: dispatch -> watch on your own schedule -> steer if it's drifting -> collect.
+- **codex_deploy** { task, deploy_type, target?=mini, repo_path?, repo?, branch?, allow_mutations?=false,
+  allow_app_store_submit?=false, allow_browser_dashboard?=false, queue_entry?, health_check_urls? }
+  -> starts the same steerable Codex worker with deployment guardrails for App Store/TestFlight,
+  Cloudflare Pages/Workers, or vendor-infra queue work. Defaults to read-only/preflight; set
+  allow_mutations=true for actual uploads/deploys. It never allows final App Store submission unless
+  allow_app_store_submit=true. Secret values must stay in remote env files/dashboard secrets, never prompts.
 
 ## Notes
 - Image gen is agentic (the model writes the file); allow up to ~4 min.
 - API-only model snapshots are irrelevant here — the CLI session picks the backing model.
 - Full machine-readable param schemas: call \`tools/list\`.
 `;
+
+function buildDeployPrompt(args: CodexDeployArgs): string {
+  const urls = args.health_check_urls.length
+    ? args.health_check_urls.map((u) => `- ${u}`).join('\n')
+    : '- None supplied; infer only from repo/config/docs and report what was checked.';
+  const repoSetup = args.repo_path
+    ? [
+        `Preferred repo/worktree on target host: ${args.repo_path}`,
+        `Start by verifying it exists: cd '${args.repo_path}' && git status --short --branch.`,
+      ].join('\n')
+    : args.repo
+      ? [
+          `Repo slug to prepare on target host: ${args.repo}`,
+          `Use ~/dev as work root unless a local convention says otherwise.`,
+          `If the repo directory exists, fetch and checkout ${args.branch}; otherwise clone it, then checkout ${args.branch}.`,
+        ].join('\n')
+      : `No repo path/slug supplied. Work from the current target host context and stop if a repo is required.`;
+
+  const deployRules: Record<CodexDeployArgs['deploy_type'], string> = {
+    appstore_status: [
+      `App Store profile: read-only status/preflight unless allow_mutations is true.`,
+      `Use ASC env path only by reference: ${args.asc_key_path}. Never print private key contents.`,
+      `Export ASC_KEY_ID=J77JD8RJXF, ASC_ISSUER_ID=5ed3a276-d6c0-43eb-ba70-13eed9b35a7e, ASC_KEY_PATH=${args.asc_key_path}, ASC_BETA_GROUP_NAME="External Beta" when running deployer status/preflight commands.`,
+      `Check App Store subscription/paywall and AI/data-consent gates when relevant.`,
+    ].join('\n'),
+    appstore_testflight: [
+      `App Store/TestFlight profile: archive/upload/TestFlight work is allowed only when allow_mutations is true.`,
+      `Use ASC env path only by reference: ${args.asc_key_path}. Never print private key contents.`,
+      `Export ASC_KEY_ID=J77JD8RJXF, ASC_ISSUER_ID=5ed3a276-d6c0-43eb-ba70-13eed9b35a7e, ASC_KEY_PATH=${args.asc_key_path}, ASC_BETA_GROUP_NAME="External Beta" before scripts/appstore-deploy.mjs commands.`,
+      `Use --allow-provisioning-updates for automatic signing. Missing local distribution cert is not a blocker with automatic signing + ASC API credentials.`,
+      `Do not final-submit App Store review/resubmission unless allow_app_store_submit is true.`,
+    ].join('\n'),
+    cloudflare_pages: [
+      `Cloudflare Pages profile: deploy only when allow_mutations is true; otherwise run build/status/dry-run/read-only checks.`,
+      `Candidate env path on target: ${args.env_candidate_path}. Source/select variables only if needed; never echo values.`,
+      `Before Cloudflare/DNS/provider-secret mutations, read /Users/ellaai/ai-company/infra/CLOUDFLARE_VENDOR_CONTEXT.md and /Users/ellaai/ai-company/infra/imports/cloudflare-vendor-infra-status.md.`,
+      `Prefer repo package scripts such as npm run cf:deploy over ad hoc wrangler commands.`,
+    ].join('\n'),
+    cloudflare_worker: [
+      `Cloudflare Worker profile: deploy only when allow_mutations is true; otherwise run build/status/dry-run/read-only checks.`,
+      `Candidate env path on target: ${args.env_candidate_path}. Source/select variables only if needed; never echo values.`,
+      `Before Cloudflare/DNS/provider-secret mutations, read /Users/ellaai/ai-company/infra/CLOUDFLARE_VENDOR_CONTEXT.md and /Users/ellaai/ai-company/infra/imports/cloudflare-vendor-infra-status.md.`,
+      `Inspect existing bindings/routes/secrets by name only before mutation; do not overwrite unrelated live app infra.`,
+    ].join('\n'),
+    vendor_infra: [
+      `Vendor infra profile: use the shared queue protocol when a queue entry is supplied.`,
+      `Queue path: /Users/greg/.codex/notes/vendor-handoff-queue.md may not exist on the Mini; if unavailable, use the repo/global notes available on the target and report the limitation.`,
+      `If queue_entry is supplied, claim only that entry. Do not work on unrelated IN_PROGRESS or DONE entries.`,
+      `Browser/dashboard work requires allow_browser_dashboard=true and an existing logged-in Chrome/vendor session on the target. If not available, stop and report the login/dashboard blocker.`,
+      `Never write secrets to Markdown, queue files, GitHub, logs, or chat.`,
+    ].join('\n'),
+    custom: `Custom deployment profile. Apply the global rules below strictly and stop before any unclear or risky mutation.`,
+  };
+
+  return [
+    `You are a remote deployment worker launched by the gpt5 MCP dispatcher.`,
+    `Deploy type: ${args.deploy_type}`,
+    `Mutation gate: allow_mutations=${args.allow_mutations}`,
+    `App Store final submit gate: allow_app_store_submit=${args.allow_app_store_submit}`,
+    `Browser/vendor dashboard gate: allow_browser_dashboard=${args.allow_browser_dashboard}`,
+    args.queue_entry ? `Queue entry: ${args.queue_entry}` : `Queue entry: none supplied`,
+    ``,
+    `GLOBAL SAFETY RULES`,
+    `- Do not print, paste, commit, or write secret values anywhere. Redact all token/key values in final output.`,
+    `- If allow_mutations=false, do read-only checks, status, preflight, dry-run, and planning only. Stop before deploy/upload/dashboard/API mutations.`,
+    `- If allow_mutations=true, mutate only the explicitly scoped app/resource from this task.`,
+    `- For iOS/App Store subscription or AI/camera/vision/audio/transcript apps, verify the relevant App Store data-consent and subscription/paywall gates before any submission-related work.`,
+    `- Do not press/call final App Store submission/resubmission unless allow_app_store_submit=true and the task explicitly asks for it.`,
+    `- For Cloudflare/DNS/provider-secret work, inspect live app registry/context first and run scoped health checks after mutation.`,
+    `- Prefer existing repo scripts and config over hand-written commands.`,
+    `- Keep a concise audit trail: commands run, files changed, deploy IDs/build numbers, health checks, and blockers. Do not include secrets.`,
+    ``,
+    `REPO SETUP`,
+    repoSetup,
+    ``,
+    `PROFILE RULES`,
+    deployRules[args.deploy_type],
+    ``,
+    `POST-MUTATION HEALTH CHECK URLS`,
+    urls,
+    ``,
+    `TASK`,
+    args.task,
+  ].join('\n');
+}
 
 // Main function
 async function main() {
@@ -240,6 +359,11 @@ async function main() {
             name: "codex_dispatch",
             description: "Dispatch a Codex worker as a background job (like spawning a subagent). Non-blocking: returns a job_id IMMEDIATELY while Codex does the build/codemod/test grind unattended. The job is STEERABLE — watch it with codex_status, course-correct mid-run with codex_steer, stop with codex_interrupt, collect with codex_result. Default sandbox danger-full-access.",
             inputSchema: zodToJsonSchema(CodexDispatchSchema),
+          },
+          {
+            name: "codex_deploy",
+            description: "Dispatch a deployment-focused Codex worker, defaulting to target=mini, with guardrails for App Store/TestFlight, Cloudflare Pages/Workers, and vendor-infra queue work. Defaults to read-only/preflight; set allow_mutations=true for actual deploy/upload/vendor mutations. Never include secret values in the task.",
+            inputSchema: zodToJsonSchema(CodexDeploySchema),
           },
           {
             name: "codex_status",
@@ -365,6 +489,50 @@ async function main() {
                 note: remote
                   ? "Dispatched to REMOTE worker. It survives this laptop closing — reconnect any time with codex_status. It will push a job branch + open a PR when done."
                   : "Dispatched (steerable). Watch with codex_status, steer mid-run with codex_steer, collect with codex_result.",
+              }, null, 2) }],
+            };
+          }
+
+          case "codex_deploy": {
+            const args = CodexDeploySchema.parse(request.params.arguments) as CodexDeployArgs;
+            const prompt = buildDeployPrompt(args);
+            let m;
+            try {
+              m = startSession({
+                prompt,
+                model: args.model,
+                sandbox: args.sandbox,
+                effort: args.reasoning_effort,
+                label: args.label || `${args.deploy_type}: ${args.repo_path || args.repo || 'deploy'}`,
+                target: args.target,
+                // Deploy jobs intentionally do NOT pass repo into the generic
+                // remote prelude: that prelude creates a PR branch. The deploy
+                // prompt handles repo_path/repo setup without forcing PR behavior.
+                branch: args.branch,
+                requireCodexMatch: true,
+              });
+            } catch (e: any) {
+              return {
+                content: [{ type: "text", text: `codex_deploy preflight failed: ${e?.message || String(e)}` }],
+                isError: true,
+              };
+            }
+            console.error(`Codex deploy dispatch: ${m.id} type=${args.deploy_type} target=${m.target} cwd=${m.cwd}`);
+            return {
+              content: [{ type: "text", text: JSON.stringify({
+                job_id: m.id,
+                state: m.state,
+                deploy_type: args.deploy_type,
+                target: m.target,
+                host: m.host,
+                cwd: m.cwd,
+                model: m.model,
+                sandbox: args.sandbox,
+                allow_mutations: args.allow_mutations,
+                allow_app_store_submit: args.allow_app_store_submit,
+                allow_browser_dashboard: args.allow_browser_dashboard,
+                ...(m.configNote ? { configFixed: m.configNote } : {}),
+                note: "Deployment worker dispatched. Watch with codex_status, steer with codex_steer, collect with codex_result. Secret values must remain in target env/dashboard stores, never prompts or Markdown.",
               }, null, 2) }],
             };
           }
