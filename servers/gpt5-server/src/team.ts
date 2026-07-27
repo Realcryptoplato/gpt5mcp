@@ -18,7 +18,7 @@ const LOCAL_TEAM_JOBS = join(homedir(), '.gpt5mcp', 'team-jobs');
 
 export type EmployeeStatus = 'active' | 'archived';
 export type EmployeeSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';
-export type EmployeeEffort = 'low' | 'medium' | 'high' | 'xhigh';
+export type EmployeeEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 
 export interface BridgeBinding {
   port: number;
@@ -114,6 +114,8 @@ interface TeamJob {
   bridgeJobPath?: string;
   skills: SkillRef[];
   libraryCommit?: string;
+  model?: string;
+  reasoningEffort?: EmployeeEffort;
   harvest?: {
     skillName: string;
     topic: string;
@@ -594,6 +596,8 @@ function dispatchBridge(
   prompt: string,
   skills: SkillRef[],
   libraryCommit: string,
+  model: string | undefined,
+  reasoningEffort: EmployeeEffort,
   label?: string,
 ): TeamJob {
   const id = newTeamJobId('tb');
@@ -603,6 +607,8 @@ function dispatchBridge(
     prompt,
     label: label || `${manifest.name} MCP dispatch`,
     notify_telegram: manifest.bridge?.notifyTelegram !== false,
+    model,
+    reasoning_effort: reasoningEffort,
   }), 'utf8').toString('base64');
   const tokenPath = `${targetHome(target)}/.gpt5mcp/bridge-token`;
   const python = [
@@ -626,6 +632,8 @@ function dispatchBridge(
     bridgeJobPath: remotePath,
     skills,
     libraryCommit,
+    model,
+    reasoningEffort,
   };
   writeTeamJob(job);
   return job;
@@ -648,6 +656,8 @@ export function dispatchEmployee(args: TeamDispatchArgs): {
     : syncCapabilityLibrary(args.target);
   const capabilities = resolveEmployeeCapabilities(target, manifest, library.path, args.extraSkills);
   const prompt = employeePrompt(target, manifest, args.prompt, capabilities.skills);
+  const model = args.model || manifest.model;
+  const reasoningEffort = args.reasoningEffort || manifest.reasoningEffort;
 
   if (manifest.bridge) {
     const bridgePrompt = [
@@ -657,7 +667,16 @@ export function dispatchEmployee(args: TeamDispatchArgs): {
       prompt,
     ].join('\n');
     return {
-      job: dispatchBridge(target, manifest, bridgePrompt, capabilities.skills, library.commit, args.label),
+      job: dispatchBridge(
+        target,
+        manifest,
+        bridgePrompt,
+        capabilities.skills,
+        library.commit,
+        model,
+        reasoningEffort,
+        args.label,
+      ),
       plugins: capabilities.plugins,
     };
   }
@@ -665,9 +684,9 @@ export function dispatchEmployee(args: TeamDispatchArgs): {
   const start: StartOpts = {
     prompt,
     cwd: manifest.workspace,
-    model: args.model || manifest.model,
+    model,
     sandbox: args.sandbox || manifest.sandbox,
-    effort: args.reasoningEffort || manifest.reasoningEffort,
+    effort: reasoningEffort,
     label: args.label || `${manifest.name}: ${args.prompt.slice(0, 60)}`,
     target: manifest.target,
     threadId: manifest.threadId,
@@ -687,6 +706,8 @@ export function dispatchEmployee(args: TeamDispatchArgs): {
     codexJobId: session.id,
     skills: capabilities.skills,
     libraryCommit: library.commit,
+    model,
+    reasoningEffort,
   };
   writeTeamJob(job);
   return { job, session, plugins: capabilities.plugins };
@@ -741,6 +762,8 @@ export function teamJobStatus(id: string, maxEvents = 40): any {
     error: session.error,
     skills: job.skills,
     libraryCommit: job.libraryCommit,
+    model: job.model,
+    reasoningEffort: job.reasoningEffort,
     events: sessionEvents(session.id, maxEvents),
   };
 }
@@ -778,6 +801,8 @@ export function teamJobResult(id: string): any {
     threadId: session.threadId,
     skills: job.skills,
     libraryCommit: job.libraryCommit,
+    model: job.model,
+    reasoningEffort: job.reasoningEffort,
     filesChanged: sessionChangedFiles(session.id),
     finalMessage,
     harvestCandidate: materializeHarvest(job, finalMessage),
