@@ -6,6 +6,8 @@ import {
   CallToolRequestSchema,
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
   ErrorCode,
   McpError
 } from "@modelcontextprotocol/sdk/types.js";
@@ -21,8 +23,8 @@ import {
 } from './codexSession.js';
 import {
   dispatchEmployee, fireEmployee, getEmployee, harvestEmployeeKnowledge, hireEmployee,
-  listEmployees, syncCapabilityLibrary, syncEmployeePlugins, teamJobResult, teamJobStatus,
-  updateEmployee,
+  getTeamCapabilityManifest, listEmployees, syncCapabilityLibrary, syncEmployeePlugins,
+  teamJobResult, teamJobStatus, updateEmployee,
 } from './team.js';
 
 // Initialize environment from parent directory
@@ -127,10 +129,16 @@ const CodexInterruptSchema = z.object({
   job_id: z.string().describe("Job id to interrupt (sends turn/interrupt; keeps the thread)")
 });
 
+const TeamManifestSchema = z.object({
+  target: z.string().optional().default("local").describe("Target whose live employees, role packs, approved skills, plugins, and defaults should be returned"),
+});
+
 const TeamHireSchema = z.object({
   name: z.string().min(1).describe("Stable employee name, for example Sophia or a new hire such as Olivia"),
   target: z.string().optional().default("local").describe("Dispatch target that owns the employee state: local, mini, a preset, or user@host"),
-  workspace: z.string().describe("Absolute workspace folder on the target"),
+  workspace: z.string().describe("Absolute workspace folder on the target. It may already exist, or team_hire can create it by cloning repo."),
+  repo: z.string().optional().describe("Optional GitHub owner/name. If workspace does not exist, clone this repo into it on the target before hiring."),
+  branch: z.string().optional().describe("Optional branch to clone when repo is supplied; defaults to the repository's default branch."),
   role_pack: z.string().optional().default("general").describe("Role pack from the capability library"),
   skills: z.array(z.string()).optional().default([]).describe("Additional approved skill ids"),
   plugins: z.array(z.string()).optional().default([]).describe("Additional plugin ids recorded as requirements"),
@@ -222,6 +230,7 @@ type CodexStatusArgs = z.infer<typeof CodexStatusSchema>;
 type CodexResultArgs = z.infer<typeof CodexResultSchema>;
 type CodexSteerArgs = z.infer<typeof CodexSteerSchema>;
 type CodexInterruptArgs = z.infer<typeof CodexInterruptSchema>;
+type TeamManifestArgs = z.infer<typeof TeamManifestSchema>;
 type TeamHireArgs = z.infer<typeof TeamHireSchema>;
 type TeamUpdateArgs = z.infer<typeof TeamUpdateSchema>;
 type TeamEmployeeArgs = z.infer<typeof TeamEmployeeSchema>;
@@ -233,9 +242,94 @@ type TeamHarvestArgs = z.infer<typeof TeamHarvestSchema>;
 type TeamLibrarySyncArgs = z.infer<typeof TeamLibrarySyncSchema>;
 type TeamPluginSyncArgs = z.infer<typeof TeamPluginSyncSchema>;
 
-// Usage doc exposed as an MCP resource so connecting clients can fetch a
-// human-readable README through the protocol (in addition to tools/list, which
-// already exposes every tool's param schema).
+const SERVER_INSTRUCTIONS = `This server dispatches Codex workers and manages durable named team employees on local or remote targets.
+
+For team work, START by calling team_manifest for the intended target (usually local or mini). It returns the live employees, approved role packs, skills, plugins, defaults, and workflow. Then call team_list and reuse a suitable employee when possible.
+
+To create an employee, call team_hire with a stable name, target, absolute workspace, and role_pack. If the checkout does not exist, also pass repo=owner/name and optional branch; the server clones it on that target. Extra skills must be approved ids returned by team_manifest. Run team_plugin_sync when a role requires plugins.
+
+Call team_dispatch for work, then team_status and team_result. Repeated assignments resume the employee's durable session and memory. Omit model/reasoning to use employee defaults; per-job overrides do not change those defaults. Telegram-bound employees run through their bridge so results can appear in both MCP and Telegram.
+
+Use team_skill_harvest to extract reusable knowledge; candidates remain quarantined until audited. team_fire archives by default. Read usage://team-onboarding for the complete playbook, or use the team-hire-employee MCP prompt.`;
+
+const TEAM_ONBOARDING = `# Managed team onboarding
+
+This is the canonical fresh-client workflow for creating and operating durable Codex employees.
+
+## 1. Discover before changing anything
+
+1. Call \`team_manifest\` with the intended \`target\` (normally \`local\` or \`mini\`).
+2. Review its live \`employees\`, \`rolePacks\`, \`approvedSkills\`, \`approvedPlugins\`, and defaults.
+3. Call \`team_list\` and reuse an existing employee when its workspace and role fit.
+
+Do not guess skill ids, plugin ids, role packs, remote paths, or employee names. The
+manifest is generated from the target's current versioned capability library and
+employee state.
+
+## 2. Hire into an existing checkout
+
+\`\`\`json
+{
+  "name": "Olivia",
+  "target": "mini",
+  "workspace": "/Users/ellaai/dev/acme-api",
+  "role_pack": "backend-engineer"
+}
+\`\`\`
+
+The workspace must be an absolute path on the selected target.
+
+## 3. Hire and clone a repository
+
+If the workspace does not exist, \`team_hire\` can clone it first:
+
+\`\`\`json
+{
+  "name": "Olivia",
+  "target": "mini",
+  "workspace": "/Users/ellaai/dev/acme-api",
+  "repo": "owner/acme-api",
+  "branch": "main",
+  "role_pack": "backend-engineer",
+  "skills": ["an-approved-skill-id"]
+}
+\`\`\`
+
+The target must already have working GitHub CLI authentication for a private repo.
+The optional \`skills\` array extends the selected role pack and accepts only ids in
+\`team_manifest.approvedSkills\`.
+
+## 4. Verify capabilities and plugins
+
+Call \`team_get\` after hiring to see the exact resolved skills, plugins, capability
+library commit, model, reasoning effort, sandbox, workspace, and bridge binding.
+Call \`team_plugin_sync\` with \`install_missing=true\` only when you intend to install
+the approved pinned plugin requirements on that target.
+
+## 5. Dispatch and resume
+
+Call \`team_dispatch\`, retain its \`job_id\`, poll \`team_status\`, and collect
+\`team_result\`. Future dispatches to the same employee resume its durable Codex
+thread and employee memory. A one-job model, reasoning, sandbox, or extra-skill
+override does not mutate the employee's defaults.
+
+Telegram-bound employees (such as Jack, Henry, or Sophia when configured) queue
+through their authenticated loopback bridge. The bridge runs the durable session
+once and can publish the result to both the MCP ledger and Telegram.
+
+## 6. Improve or retire
+
+- \`team_update\` changes durable configuration.
+- \`team_skill_harvest\` asks the employee's existing session to synthesize a candidate skill. Candidates are quarantined until audit and promotion.
+- \`team_fire\` archives recoverably by default; \`purge=true\` is permanent and should be explicit.
+
+Use \`team_manifest\` again whenever you switch targets or before hiring: different
+machines may have different existing employees while sharing the same versioned
+capability library.`;
+
+// Usage docs exposed as MCP resources so connecting clients can fetch a
+// human-readable guide in addition to the initialization instructions and
+// machine-readable tool schemas.
 const README = `# gpt5-server (MCP)
 
 Drives the **Codex CLI** (ChatGPT OAuth) — no OPENAI_API_KEY, no credits.
@@ -296,8 +390,12 @@ Pattern: dispatch -> watch on your own schedule -> steer if it's drifting -> col
 Employees are target-scoped, pinned to an absolute workspace, and resume their
 durable Codex thread. Approved skills are attached as native app-server skill
 inputs; quarantined or revoked skills are rejected.
+- **team_manifest** is the starting point for every target. It returns live
+  employees, role packs, approved skills/plugins, defaults, and the recommended
+  workflow from that target.
 - **team_hire** / **team_update** / **team_list** / **team_get** / **team_fire**
-  manage named employees. Fire archives by default; purge is explicit.
+  manage named employees. \`team_hire\` can clone \`repo\` into a missing absolute
+  \`workspace\` before creating the employee. Fire archives by default; purge is explicit.
 - **team_dispatch** starts a non-blocking employee job. Existing Telegram
   employees queue through their loopback-only authenticated bridge and can
   return the result to both the MCP job ledger and Telegram.
@@ -313,6 +411,7 @@ inputs; quarantined or revoked skills are rejected.
 - Image gen is agentic (the model writes the file); allow up to ~4 min.
 - API-only model snapshots are irrelevant here — the CLI session picks the backing model.
 - Full machine-readable param schemas: call \`tools/list\`.
+- Full fresh-agent playbook: read \`usage://team-onboarding\`.
 `;
 
 function buildDeployPrompt(args: CodexDeployArgs): string {
@@ -408,13 +507,19 @@ async function main() {
   // Create MCP server
   const server = new Server({
     name: "gpt5-server",
-    version: "0.1.0"
+    version: "0.2.0"
   }, {
     capabilities: {
       tools: {},
-      resources: {}
-    }
+      resources: {},
+      prompts: {},
+    },
+    instructions: SERVER_INSTRUCTIONS,
   });
+  // The SDK's generated request-schema union is intentionally enormous. Keep
+  // runtime validation in the SDK and our Zod tool schemas without forcing
+  // TypeScript to instantiate the full protocol union for every handler.
+  const protocolServer = server as any;
 
   // Set up error handling
   server.onerror = (error) => {
@@ -426,9 +531,15 @@ async function main() {
     process.exit(0);
   });
 
-  // Resource handlers — expose the usage README at usage://readme
-  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  // Resource handlers — expose concise usage plus the full team onboarding playbook.
+  protocolServer.setRequestHandler(ListResourcesRequestSchema, async () => ({
     resources: [
+      {
+        uri: "usage://team-onboarding",
+        name: "Managed team onboarding",
+        description: "Start here: discover, hire, attach approved capabilities, dispatch, resume, improve, and retire durable employees",
+        mimeType: "text/markdown",
+      },
       {
         uri: "usage://readme",
         name: "gpt5-server usage",
@@ -438,7 +549,14 @@ async function main() {
     ],
   }));
 
-  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  protocolServer.setRequestHandler(ReadResourceRequestSchema, async (request: any) => {
+    if (request.params.uri === "usage://team-onboarding") {
+      return {
+        contents: [
+          { uri: "usage://team-onboarding", mimeType: "text/markdown", text: TEAM_ONBOARDING },
+        ],
+      };
+    }
     if (request.params.uri === "usage://readme") {
       return {
         contents: [
@@ -449,8 +567,58 @@ async function main() {
     throw new McpError(ErrorCode.InvalidParams, `Unknown resource: ${request.params.uri}`);
   });
 
+  protocolServer.setRequestHandler(ListPromptsRequestSchema, async () => ({
+    prompts: [
+      {
+        name: "team-hire-employee",
+        title: "Hire a durable employee",
+        description: "Guided workflow to discover approved capabilities and create or reuse a named employee in a target repository",
+        arguments: [
+          { name: "name", description: "Desired stable employee name", required: true },
+          { name: "target", description: "local, mini, preset, or user@host", required: true },
+          { name: "workspace", description: "Absolute target-side workspace path", required: true },
+          { name: "repo", description: "Optional GitHub owner/name to clone when workspace is absent" },
+          { name: "branch", description: "Optional branch to clone" },
+          { name: "role_pack", description: "Desired role pack; verify it with team_manifest" },
+        ],
+      },
+    ],
+  }));
+
+  protocolServer.setRequestHandler(GetPromptRequestSchema, async (request: any) => {
+    if (request.params.name !== "team-hire-employee") {
+      throw new McpError(ErrorCode.InvalidParams, `Unknown prompt: ${request.params.name}`);
+    }
+    const args = request.params.arguments || {};
+    const name = args.name || "<employee-name>";
+    const target = args.target || "local";
+    const workspace = args.workspace || "<absolute-target-workspace>";
+    const repo = args.repo || "<optional-owner/repo>";
+    const branch = args.branch || "<optional-branch>";
+    const rolePack = args.role_pack || "<choose-from-team_manifest>";
+    return {
+      description: `Safely create or reuse ${name} on ${target}`,
+      messages: [{
+        role: "user",
+        content: {
+          type: "text",
+          text: `Set up a durable managed employee using the gpt5-server MCP.
+
+Desired name: ${name}
+Target: ${target}
+Absolute workspace: ${workspace}
+Repository if cloning is needed: ${repo}
+Branch: ${branch}
+Desired role: ${rolePack}
+
+First call team_manifest(target=${target}) and team_list(target=${target}). Reuse a suitable existing employee if one already owns this workspace and role. Otherwise select only a role pack, skills, and plugins returned by team_manifest; then call team_hire with the supplied name, target, workspace, and selected role. If the workspace is absent and a real repo was supplied, pass repo and branch so it is cloned on the target. Verify with team_get, sync approved plugin requirements when needed, and report the resolved capabilities and defaults. Do not dispatch project work until setup has been verified.`,
+        },
+      }],
+    };
+  });
+
   // Set up tool handlers
-  server.setRequestHandler(
+  protocolServer.setRequestHandler(
     ListToolsRequestSchema,
     async () => {
       console.error("Handling ListToolsRequest");
@@ -502,8 +670,13 @@ async function main() {
             inputSchema: zodToJsonSchema(CodexInterruptSchema),
           },
           {
+            name: "team_manifest",
+            description: "START HERE for managed team work. Returns the selected target's live employees, role packs, approved skills/plugins, defaults, capability-library commit, and recommended workflow so a fresh agent does not have to guess.",
+            inputSchema: zodToJsonSchema(TeamManifestSchema),
+          },
+          {
             name: "team_hire",
-            description: "Create a durable named employee on a local or remote target with an assigned workspace, charter, role pack, approved skills, memory file, and resumable Codex thread. Set bridge_port to bind an existing Telegram-backed session.",
+            description: "Create a durable named employee on a local or remote target with an assigned workspace, charter, role pack, approved skills, memory file, and resumable Codex thread. If workspace is absent, pass repo and optional branch to clone it on the target first. Set bridge_port to bind an existing Telegram-backed session.",
             inputSchema: zodToJsonSchema(TeamHireSchema),
           },
           {
@@ -561,9 +734,9 @@ async function main() {
     }
   );
 
-  server.setRequestHandler(
+  protocolServer.setRequestHandler(
     CallToolRequestSchema,
-    async (request) => {
+    async (request: any) => {
       console.error("Handling CallToolRequest:", JSON.stringify(request.params));
       
       try {
@@ -759,12 +932,24 @@ async function main() {
             return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }], ...(r.ok ? {} : { isError: true }) };
           }
 
+          case "team_manifest": {
+            const args = TeamManifestSchema.parse(request.params.arguments) as TeamManifestArgs;
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify(getTeamCapabilityManifest(args.target), null, 2),
+              }],
+            };
+          }
+
           case "team_hire": {
             const args = TeamHireSchema.parse(request.params.arguments) as TeamHireArgs;
             const employee = hireEmployee({
               name: args.name,
               target: args.target,
               workspace: args.workspace,
+              repo: args.repo,
+              branch: args.branch,
               rolePack: args.role_pack,
               skills: args.skills,
               plugins: args.plugins,

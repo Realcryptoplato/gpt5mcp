@@ -1,7 +1,7 @@
 {
   "name": "gpt5-server",
-  "version": "0.1.0",
-  "description": "MCP server for OpenAI GPT-5 API integration",
+  "version": "0.2.0",
+  "description": "MCP server for Codex dispatch and durable managed team employees",
   "type": "module",
   "main": "build/index.js",
   "bin": {
@@ -13,14 +13,14 @@
     "dev": "tsc && node build/index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "0.6.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "dotenv": "^16.3.1",
     "node-fetch": "^3.3.2",
-    "zod": "^3.22.4",
-    "zod-to-json-schema": "^3.22.1"
+    "zod": "^3.25.76",
+    "zod-to-json-schema": "^3.25.2"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
-    "typescript": "^5.3.2"
+    "typescript": "^5.5.4"
   }
 }
