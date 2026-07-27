@@ -1096,7 +1096,7 @@ First call team_manifest(target=${target}) and team_list(target=${target}). Reus
             return {
               content: [{
                 type: "text",
-                text: JSON.stringify(syncCapabilityLibrary(args.target, args.ref), null, 2),
+                text: JSON.stringify(syncCapabilityLibrary(args.target, args.ref, true), null, 2),
               }],
             };
           }
