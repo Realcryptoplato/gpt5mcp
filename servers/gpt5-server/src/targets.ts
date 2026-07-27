@@ -42,9 +42,15 @@ export function resolveTarget(spec?: string): Target {
 }
 
 const SSH_OPTS = ['-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes'];
+const LOCAL_COMMAND_TIMEOUT_MS = 20_000;
+const REMOTE_COMMAND_TIMEOUT_MS = 60_000;
 
 /** Run a shell command on the target, return stdout (throws on failure). */
-export function targetExec(t: Target, cmd: string, timeoutMs = 20000): string {
+export function targetExec(
+  t: Target,
+  cmd: string,
+  timeoutMs = t.type === 'ssh' ? REMOTE_COMMAND_TIMEOUT_MS : LOCAL_COMMAND_TIMEOUT_MS,
+): string {
   if (t.type === 'local') {
     return execFileSync('/bin/bash', ['-c', cmd], { encoding: 'utf8', timeout: timeoutMs });
   }
