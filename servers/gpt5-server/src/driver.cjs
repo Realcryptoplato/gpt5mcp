@@ -31,8 +31,21 @@ const CWD = arg('--cwd', process.cwd());
 const MODEL = arg('--model', null);
 const EFFORT = arg('--effort', null);
 const SANDBOX = arg('--sandbox', 'danger-full-access'); // danger-full-access | workspace-write | read-only
+const RESUME_THREAD_ID = arg('--thread-id', null);
+const SKILLS_FILE = arg('--skills-file', null);
 const PROMPT = process.env.CODEX_SESSION_PROMPT || '';
 const CODEX_BIN = process.env.CODEX_CLI_PATH || 'codex';
+let SKILLS = [];
+if (SKILLS_FILE) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SKILLS_FILE, 'utf8'));
+    if (Array.isArray(parsed)) {
+      SKILLS = parsed.filter((item) => item && item.name && item.path);
+    }
+  } catch (e) {
+    throw new Error(`could not read skills file ${SKILLS_FILE}: ${e.message}`);
+  }
+}
 
 function sandboxPolicy() {
   if (SANDBOX === 'read-only') return { type: 'readOnly', networkAccess: false };
@@ -192,17 +205,27 @@ function rpcError(label, d) {
 (async () => {
   try {
     rpcError('initialize', await send('initialize', { clientInfo: { name: 'gpt5-server-driver', version: '1.0' } }, 30000));
-    const ts = rpcError('thread/start', await send('thread/start', { cwd: CWD }, 30000));
+    child.stdin.write(JSON.stringify({ method: 'initialized', params: {} }) + '\n');
+    const threadMethod = RESUME_THREAD_ID ? 'thread/resume' : 'thread/start';
+    const threadParams = RESUME_THREAD_ID
+      ? { threadId: RESUME_THREAD_ID, cwd: CWD }
+      : { cwd: CWD };
+    const ts = rpcError(threadMethod, await send(threadMethod, threadParams, 30000));
     threadId = ts.result && ts.result.thread && ts.result.thread.id;
     if (!threadId) {
-      throw new Error(`thread/start returned no thread id (cwd=${CWD} may be invalid)`
+      throw new Error(`${threadMethod} returned no thread id (cwd=${CWD} may be invalid)`
         + `${stderrTail ? `\nstderr tail:\n${stderrTail.trim().slice(-800)}` : ''}`);
     }
-    writeMeta({ threadId, state: 'running' });
+    writeMeta({ threadId, resumedThreadId: RESUME_THREAD_ID || undefined, state: 'running' });
 
+    const skillMentions = SKILLS.map((skill) => `$${skill.name}`).join(' ');
+    const promptText = skillMentions ? `${skillMentions}\n\n${PROMPT}` : PROMPT;
     const turnParams = {
       threadId,
-      input: [{ type: 'text', text: PROMPT }],
+      input: [
+        { type: 'text', text: promptText },
+        ...SKILLS.map((skill) => ({ type: 'skill', name: skill.name, path: skill.path })),
+      ],
       sandboxPolicy: sandboxPolicy(),
       approvalPolicy: 'never',
     };

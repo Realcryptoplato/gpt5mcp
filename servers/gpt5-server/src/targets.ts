@@ -66,6 +66,21 @@ export function targetReadFile(t: Target, path: string): string {
   return r.ok ? r.out : '';
 }
 
+/** Write a UTF-8 file on the target, creating its parent directory. */
+export function targetWriteFile(t: Target, path: string, content: string): void {
+  if (t.type === 'local') {
+    const parent = path.replace(/\/[^/]+$/, '');
+    targetExec(t, `mkdir -p '${parent.replace(/'/g, `'\\''`)}'`);
+    const b64 = Buffer.from(content, 'utf8').toString('base64');
+    targetExec(t, `printf '%s' '${b64}' | base64 -d > '${path.replace(/'/g, `'\\''`)}'`);
+    return;
+  }
+  const p = path.replace(/'/g, `'\\''`);
+  const parent = path.replace(/\/[^/]+$/, '').replace(/'/g, `'\\''`);
+  const b64 = Buffer.from(content, 'utf8').toString('base64');
+  targetExec(t, `mkdir -p '${parent}' && printf '%s' '${b64}' | base64 -d > '${p}'`);
+}
+
 /** Append a line to a file on the target (used for the control channel). */
 export function targetAppend(t: Target, path: string, line: string): void {
   const esc = line.replace(/'/g, `'\\''`);
