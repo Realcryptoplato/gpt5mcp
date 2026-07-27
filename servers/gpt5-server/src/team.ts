@@ -418,10 +418,53 @@ function resolveEmployeeCapabilities(
     if (!targetPathExists(target, absolute)) throw new Error(`approved skill file is missing: ${absolute}`);
     return { name: id, path: absolute, version: skill.version };
   });
+  const plugins = [...new Set([...(pack.plugins || []), ...manifest.plugins])];
+  const approvedPlugins = new Set(
+    jsonOnTarget<{ plugins: Array<{ id: string; status: string }> }>(target, `${root}/registry/plugins.json`)
+      .plugins.filter((plugin) => plugin.status === 'approved')
+      .map((plugin) => plugin.id),
+  );
+  for (const plugin of plugins) {
+    if (!approvedPlugins.has(plugin)) throw new Error(`plugin is not approved: ${plugin}`);
+  }
   return {
     skills,
-    plugins: [...new Set([...(pack.plugins || []), ...manifest.plugins])],
+    plugins,
   };
+}
+
+export function syncEmployeePlugins(
+  name: string,
+  targetSpec?: string,
+  installMissing = false,
+): {
+  employee: string;
+  target: string;
+  requirements: Array<{ id: string; installed: boolean; enabled: boolean; changed: boolean }>;
+} {
+  const target = resolveTarget(targetSpec);
+  const manifest = readEmployee(target, name);
+  const library = syncCapabilityLibrary(targetSpec);
+  const capabilities = resolveEmployeeCapabilities(target, manifest, library.path);
+  const readPluginList = () => targetExec(target, 'codex plugin list', 120000);
+  let listing = readPluginList();
+  const requirements = [];
+  for (const id of capabilities.plugins) {
+    const line = listing.split('\n').find((value) => value.trimStart().startsWith(`${id} `)) || '';
+    let installed = /\binstalled\b/.test(line) && !/\bnot installed\b/.test(line);
+    let enabled = installed && /\benabled\b/.test(line);
+    let changed = false;
+    if ((!installed || !enabled) && installMissing) {
+      targetExec(target, `codex plugin add ${shellQuote(id)} --json`, 120000);
+      listing = readPluginList();
+      const updated = listing.split('\n').find((value) => value.trimStart().startsWith(`${id} `)) || '';
+      installed = /\binstalled\b/.test(updated) && !/\bnot installed\b/.test(updated);
+      enabled = installed && /\benabled\b/.test(updated);
+      changed = true;
+    }
+    requirements.push({ id, installed, enabled, changed });
+  }
+  return { employee: manifest.name, target: target.name, requirements };
 }
 
 function employeePrompt(target: Target, manifest: EmployeeManifest, prompt: string, skills: SkillRef[]): string {

@@ -22,6 +22,8 @@ target such as `mini`, or an existing Telegram-backed Codex session.
   thread and attach approved skills as native app-server skill inputs.
 - `team_library_sync` installs or updates the private, versioned capability
   library on a target.
+- `team_plugin_sync` verifies an employee's approved plugin requirements and
+  can explicitly install missing marketplace plugins.
 - `team_skill_harvest` asks an existing employee—including a Telegram-backed
   employee—to synthesize its learned workflow into a quarantined candidate
   skill for review. It never auto-promotes generated knowledge.
