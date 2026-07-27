@@ -14,10 +14,14 @@
 This fork can manage named, long-lived Codex employees on the laptop, a remote
 target such as `mini`, or an existing Telegram-backed Codex session.
 
+- `team_manifest` is the required starting point for a fresh agent. It returns
+  the selected target's live employees, role packs, approved skills/plugins,
+  defaults, capability-library commit, and recommended workflow.
 - `team_hire`, `team_update`, `team_list`, `team_get`, and `team_fire` manage
   employee manifests, assigned workspaces, role packs, skills, and durable
-  thread ids. Firing archives by default; permanent deletion requires
-  `purge=true`.
+  thread ids. If an absolute workspace does not exist, `team_hire` can clone a
+  supplied `owner/repo` and optional branch into it first. Firing archives by
+  default; permanent deletion requires `purge=true`.
 - `team_dispatch`, `team_status`, and `team_result` resume the employee's Codex
   thread and attach approved skills as native app-server skill inputs.
 - `team_library_sync` installs or updates the private, versioned capability
@@ -32,6 +36,12 @@ Employees are target-scoped and have an explicit absolute workspace. Role packs
 resolve only skills listed in the library's approved registry; revoked and
 quarantined skills fail closed.
 
+The MCP initialization response carries the short operating instructions
+automatically. Clients that expose resources can read
+`usage://team-onboarding`, and clients that expose MCP prompts can use
+`team-hire-employee`. Together with `team_manifest`, this means a new or resumed
+agent can discover the workflow without relying on conversation history.
+
 Telegram employees use a loopback-only, token-authenticated bridge ingress.
 The bridge queues the task into the bot's existing durable Codex thread and can
 send the final response both to the MCP caller's job ledger and to Telegram.
@@ -43,15 +53,19 @@ Telegram-backed MCP jobs both honor the effective employee/job configuration;
 ordinary Telegram messages continue to use the bridge process defaults.
 
 ```text
-team_library_sync target=mini
-team_hire name=Sophia target=mini workspace=/absolute/path role_pack=ios-engineer bridge_port=8111
-team_dispatch employee=Sophia target=mini prompt="Review the current SwiftUI architecture"
+team_manifest target=mini
+team_list target=mini
+team_hire name=Olivia target=mini workspace=/Users/ellaai/dev/acme-api repo=owner/acme-api branch=main role_pack=backend-engineer
+team_get name=Olivia target=mini
+team_plugin_sync employee=Olivia target=mini install_missing=true
+team_dispatch employee=Olivia target=mini prompt="Review the current API architecture"
 team_status job_id=...
 team_result job_id=...
 ```
 
 After rebuilding, fully restart MCP clients such as Codex Desktop or Claude
-Desktop/Code so they reconnect and refresh `tools/list`.
+Desktop/Code so they reconnect and refresh the initialization instructions,
+tools, resources, and prompts.
 
 ---
 

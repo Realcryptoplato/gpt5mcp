@@ -2,7 +2,7 @@ import {
   existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'fs';
 import { homedir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import {
   Target, resolveTarget, targetExec, targetReadFile, targetTry, targetWriteFile,
 } from './targets.js';
@@ -32,6 +32,8 @@ export interface EmployeeManifest {
   slug: string;
   target: string;
   workspace: string;
+  repo?: string;
+  branch?: string;
   rolePack: string;
   skills: string[];
   plugins: string[];
@@ -56,6 +58,8 @@ export interface HireArgs {
   name: string;
   target?: string;
   workspace: string;
+  repo?: string;
+  branch?: string;
   rolePack?: string;
   skills?: string[];
   plugins?: string[];
@@ -96,10 +100,46 @@ export interface TeamDispatchArgs {
   extraSkills?: string[];
 }
 
+export interface TeamCapabilityManifest {
+  schemaVersion: 1;
+  target: string;
+  library: { path: string; commit: string };
+  defaults: {
+    model?: string;
+    reasoningEffort?: EmployeeEffort;
+    sandbox?: EmployeeSandbox;
+  };
+  workflow: string[];
+  rolePacks: Array<{
+    id: string;
+    description: string;
+    skills: string[];
+    plugins: string[];
+    defaults: {
+      model?: string;
+      reasoningEffort?: EmployeeEffort;
+      sandbox?: EmployeeSandbox;
+    };
+  }>;
+  approvedSkills: Array<{
+    id: string;
+    version: string;
+    trust?: string;
+    description?: string;
+  }>;
+  approvedPlugins: Array<{
+    id: string;
+    source?: string;
+    reason?: string;
+  }>;
+  employees: EmployeeManifest[];
+}
+
 interface ApprovedSkill {
   id: string;
   path: string;
   version: string;
+  trust?: string;
 }
 
 interface TeamJob {
@@ -138,6 +178,27 @@ function slugify(value: string): string {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function skillDescription(markdown: string): string | undefined {
+  const frontmatter = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  const raw = frontmatter?.[1].match(/^description:\s*(.+)$/m)?.[1].trim();
+  if (!raw) return undefined;
+  if (raw.startsWith('"') && raw.endsWith('"')) {
+    try { return JSON.parse(raw); } catch {}
+  }
+  if (raw.startsWith("'") && raw.endsWith("'")) return raw.slice(1, -1);
+  return raw;
+}
+
+function githubRepoSlug(value: string): string | undefined {
+  const trimmed = value.trim().replace(/\.git$/, '');
+  const ssh = trimmed.match(/^git@github\.com:(.+\/.+)$/i);
+  const https = trimmed.match(/^https?:\/\/github\.com\/(.+\/.+)$/i);
+  const candidate = ssh?.[1] || https?.[1] || trimmed;
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(candidate)
+    ? candidate.toLowerCase()
+    : undefined;
 }
 
 function targetHome(target: Target): string {
@@ -253,14 +314,52 @@ export function hireEmployee(args: HireArgs): EmployeeManifest {
   const slug = slugify(args.name);
   const path = employeeManifestPath(target, slug);
   if (targetPathExists(target, path)) throw new Error(`employee ${args.name} already exists on ${target.name}`);
+  const expectedRepo = args.repo ? githubRepoSlug(args.repo) : undefined;
+  if (args.repo && !expectedRepo) {
+    throw new Error('repo must be a GitHub owner/name slug or GitHub clone URL');
+  }
+  if (!args.workspace.startsWith('/')) {
+    throw new Error('workspace must be an absolute path on the target');
+  }
+  if (!targetPathExists(target, args.workspace, 'dir') && args.repo) {
+    const parent = dirname(args.workspace);
+    targetExec(target, `mkdir -p ${shellQuote(parent)}`);
+    targetExec(
+      target,
+      `gh repo clone ${shellQuote(args.repo)} ${shellQuote(args.workspace)}` +
+      (args.branch ? ` -- --branch ${shellQuote(args.branch)}` : ''),
+      120000,
+    );
+  }
   if (!targetPathExists(target, args.workspace, 'dir')) {
-    throw new Error(`workspace does not exist on ${target.name}: ${args.workspace}`);
+    throw new Error(
+      `workspace does not exist on ${target.name}: ${args.workspace}. ` +
+      `Pass repo to clone it during hiring, or prepare the folder first.`,
+    );
+  }
+  if (args.repo && !targetPathExists(target, `${args.workspace}/.git`, 'dir')) {
+    throw new Error(`workspace exists but is not a git checkout: ${args.workspace}`);
+  }
+  if (args.repo) {
+    const origin = targetTry(
+      target,
+      `git -C ${shellQuote(args.workspace)} remote get-url origin`,
+    ).out.trim();
+    const actualRepo = githubRepoSlug(origin);
+    if (actualRepo !== expectedRepo) {
+      throw new Error(
+        `workspace origin does not match repo: expected ${expectedRepo}, found ${actualRepo || origin || '(none)'}`,
+      );
+    }
   }
   const library = syncCapabilityLibrary(args.target);
   const templatePath = `${library.path}/employees/templates/${args.rolePack || 'general'}.json`;
   const template = targetPathExists(target, templatePath)
     ? jsonOnTarget<any>(target, templatePath)
     : {};
+  const resolvedBranch = args.repo
+    ? targetTry(target, `git -C ${shellQuote(args.workspace)} branch --show-current`).out.trim()
+    : '';
   const now = new Date().toISOString();
   const manifest: EmployeeManifest = {
     schemaVersion: 1,
@@ -268,6 +367,10 @@ export function hireEmployee(args: HireArgs): EmployeeManifest {
     slug,
     target: target.name,
     workspace: args.workspace,
+    ...(args.repo ? {
+      repo: args.repo,
+      ...(resolvedBranch ? { branch: resolvedBranch } : {}),
+    } : {}),
     rolePack: args.rolePack || template.rolePack || 'general',
     skills: [...new Set(args.skills || [])],
     plugins: [...new Set(args.plugins || [])],
@@ -296,6 +399,9 @@ export function hireEmployee(args: HireArgs): EmployeeManifest {
 export function updateEmployee(args: UpdateArgs): EmployeeManifest {
   const target = resolveTarget(args.target);
   const current = readEmployee(target, args.name);
+  if (args.workspace && !args.workspace.startsWith('/')) {
+    throw new Error('workspace must be an absolute path on the target');
+  }
   if (args.workspace && !targetPathExists(target, args.workspace, 'dir')) {
     throw new Error(`workspace does not exist on ${target.name}: ${args.workspace}`);
   }
@@ -324,6 +430,76 @@ export function updateEmployee(args: UpdateArgs): EmployeeManifest {
   resolveEmployeeCapabilities(target, next, library.path);
   saveEmployee(target, next);
   return next;
+}
+
+export function getTeamCapabilityManifest(targetSpec?: string): TeamCapabilityManifest {
+  const target = resolveTarget(targetSpec);
+  const library = syncCapabilityLibrary(targetSpec);
+  const approved = jsonOnTarget<{ skills: ApprovedSkill[] }>(
+    target,
+    `${library.path}/registry/approved.json`,
+  );
+  const plugins = jsonOnTarget<{
+    plugins: Array<{ id: string; status: string; source?: string; reason?: string }>;
+  }>(target, `${library.path}/registry/plugins.json`);
+  const template = jsonOnTarget<any>(target, `${library.path}/employees/templates/general.json`);
+  const roleFiles = target.type === 'local'
+    ? readdirSync(join(library.path, 'role-packs'))
+      .filter((name) => name.endsWith('.json'))
+      .map((name) => `${library.path}/role-packs/${name}`)
+    : targetTry(target, `find ${shellQuote(`${library.path}/role-packs`)} -maxdepth 1 -name '*.json' -type f`)
+      .out.split('\n').map((value) => value.trim()).filter(Boolean);
+  const rolePacks = roleFiles.map((path) => {
+    const pack = jsonOnTarget<any>(target, path);
+    const roleTemplatePath = `${library.path}/employees/templates/${pack.id}.json`;
+    const roleTemplate = targetPathExists(target, roleTemplatePath)
+      ? jsonOnTarget<any>(target, roleTemplatePath)
+      : template;
+    return {
+      id: pack.id,
+      description: pack.description || '',
+      skills: pack.skills || [],
+      plugins: pack.plugins || [],
+      defaults: {
+        model: roleTemplate.model,
+        reasoningEffort: roleTemplate.reasoningEffort,
+        sandbox: roleTemplate.sandbox,
+      },
+    };
+  }).sort((a, b) => a.id.localeCompare(b.id));
+  return {
+    schemaVersion: 1,
+    target: target.name,
+    library: { path: library.path, commit: library.commit },
+    defaults: {
+      model: template.model,
+      reasoningEffort: template.reasoningEffort,
+      sandbox: template.sandbox,
+    },
+    workflow: [
+      'Call team_manifest on the intended target, then team_list to reuse an existing employee when one fits.',
+      'For a new employee, choose a role pack and an absolute workspace. Pass repo and optional branch to team_hire when the checkout does not exist; hiring clones it on the target.',
+      'Use team_plugin_sync with install_missing=true when the selected role has approved plugin requirements.',
+      'Call team_dispatch. Omit model/reasoning to use employee defaults, or override them for one assignment.',
+      'Poll team_status and collect team_result. Repeated dispatches resume the same durable employee thread.',
+      'Use team_skill_harvest to propose reusable learned workflow; harvested skills remain quarantined until audited.',
+      'Use team_update for durable changes. team_fire archives recoverably unless purge=true is explicitly requested.',
+    ],
+    rolePacks,
+    approvedSkills: approved.skills.map((skill) => {
+      const markdown = targetReadFile(target, `${library.path}/${skill.path}`) || '';
+      return {
+        id: skill.id,
+        version: skill.version,
+        trust: skill.trust,
+        description: skillDescription(markdown),
+      };
+    }),
+    approvedPlugins: plugins.plugins
+      .filter((plugin) => plugin.status === 'approved')
+      .map(({ id, source, reason }) => ({ id, source, reason })),
+    employees: listEmployees(targetSpec, false),
+  };
 }
 
 export function fireEmployee(name: string, targetSpec?: string, purge = false): {
