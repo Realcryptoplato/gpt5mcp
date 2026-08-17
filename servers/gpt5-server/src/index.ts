@@ -78,7 +78,7 @@ const CodexDispatchSchema = z.object({
   branch: z.string().optional().describe("REMOTE only: base branch to start from (default 'main')."),
   require_codex_match: z.boolean().optional().default(true).describe("REMOTE only: refuse to dispatch unless the remote codex exists and its major.minor matches local (avoids running on an outdated/incompatible codex). Set false to override."),
   cwd: z.string().optional().describe("LOCAL only: working directory (defaults to server CWD). For remote, the workdir is derived from repo."),
-  model: z.string().optional().describe("Codex model. Omit to use the codex CLI's own configured default model — never hardcoded here."),
+  model: z.string().optional().describe("Model identifier. This host routes through a local OpenRouter proxy (http://127.0.0.1:10100/v1) when available, so any openrouter/<provider>/<model> string is valid. Omit to use the codex CLI's own configured default. When the proxy is offline, only standard OpenAI/gpt- model names work. Use the list_models tool to see all available models."),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().default('danger-full-access').describe("Execution sandbox. danger-full-access = files + commands + network, unattended (default)."),
   reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional().describe("Codex reasoning effort"),
   label: z.string().optional().describe("Short human label for the job")
@@ -105,7 +105,7 @@ const CodexDeploySchema = z.object({
   health_check_urls: z.array(z.string()).optional().default([]).describe("Public URLs to smoke-check after a scoped mutation."),
   asc_key_path: z.string().optional().default("/Users/ellaai/.codex/secrets/app-store-connect/AuthKey_J77JD8RJXF.p8").describe("Remote App Store Connect API private key path. Path only; never print contents."),
   env_candidate_path: z.string().optional().default("/Users/ellaai/.hermes/profiles/plato-eval/.env.cloudflare-candidate").describe("Remote candidate env file path. Source selectively; never print values."),
-  model: z.string().optional().describe("Codex model. Omit to use the codex CLI's own configured default model — never hardcoded here."),
+  model: z.string().optional().describe("Model identifier. This host routes through a local OpenRouter proxy (http://127.0.0.1:10100/v1) when available, so any openrouter/<provider>/<model> string is valid. Omit to use the codex CLI's own configured default. When the proxy is offline, only standard OpenAI/gpt- model names work. Use the list_models tool to see all available models."),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().default('danger-full-access').describe("Execution sandbox. Deploy preflight may need commands/network; actual deploys need mutations explicitly allowed."),
   reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional().default('high').describe("Codex reasoning effort"),
   label: z.string().optional().describe("Short human label for the deploy job")
@@ -330,6 +330,53 @@ capability library.`;
 // Usage docs exposed as MCP resources so connecting clients can fetch a
 // human-readable guide in addition to the initialization instructions and
 // machine-readable tool schemas.
+/** Fetch available models from the local proxy, falling back to known defaults. */
+async function fetchAvailableModels(): Promise<{
+  proxied: boolean;
+  count: number;
+  models: string[];
+  note: string;
+}> {
+  // Try local OpenRouter proxy first
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch("http://127.0.0.1:10100/v1/models", {
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (res.ok) {
+      const body = await res.json();
+      const data = body?.data || [];
+      const models = data.map((m: any) => m.id).filter(Boolean);
+      return {
+        proxied: true,
+        count: models.length,
+        models: models.sort(),
+        note: "OpenRouter proxy is online. Any openrouter/<provider>/<model> identifier is valid. For direct OpenAI routing (proxy offline), use standard gpt- model names.",
+      };
+    }
+  } catch {
+    // Proxy is offline// fall through
+  }
+
+  // Fallback: proxy unreachable, return known OpenAI models + guidance
+  return {
+    proxied: false,
+    count: 7,
+    models: [
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.5",
+      "gpt-5.4",
+      "gpt-5.4-mini",
+      "gpt-5.3-codex-spark",
+    ],
+    note: "Local OpenRouter proxy is offline. Only standard OpenAI/gpt- model names are supported. To use OpenRouter or third-party models, start the proxy or pass model=openrouter/... (dispatch will fail if the proxy can't route it). Full OpenRouter catalog: https://openrouter.ai/models",
+  };
+}
+
 const README = `# gpt5-server (MCP)
 
 Drives the **Codex CLI** (ChatGPT OAuth) — no OPENAI_API_KEY, no credits.
@@ -640,6 +687,11 @@ First call team_manifest(target=${target}) and team_list(target=${target}). Reus
             inputSchema: zodToJsonSchema(GPT5ImageSchema),
           },
           {
+            name: "list_models",
+            description: "List available models from the local OpenRouter proxy (http://127.0.0.1:10100/v1/models). If the proxy is offline, falls back to listing known OpenAI/gpt models and suggests calling OpenRouter directly. Call before codex_dispatch to see which model identifiers are valid.",
+            inputSchema: zodToJsonSchema(z.object({})),
+          },
+          {
             name: "codex_dispatch",
             description: "Dispatch a Codex worker as a background job (like spawning a subagent). Non-blocking: returns a job_id IMMEDIATELY while Codex does the build/codemod/test grind unattended. The job is STEERABLE — watch it with codex_status, course-correct mid-run with codex_steer, stop with codex_interrupt, collect with codex_result. Default sandbox danger-full-access.",
             inputSchema: zodToJsonSchema(CodexDispatchSchema),
@@ -834,6 +886,13 @@ First call team_manifest(target=${target}) and team_list(target=${target}). Reus
                   ? "Dispatched to REMOTE worker. It survives this laptop closing — reconnect any time with codex_status. It will push a job branch + open a PR when done."
                   : "Dispatched (steerable). Watch with codex_status, steer mid-run with codex_steer, collect with codex_result.",
               }, null, 2) }],
+            };
+          }
+
+          case "list_models": {
+            const models = await fetchAvailableModels();
+            return {
+              content: [{ type: "text", text: JSON.stringify(models, null, 2) }],
             };
           }
 
