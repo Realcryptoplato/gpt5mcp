@@ -2,7 +2,7 @@ import {
   existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'fs';
 import { homedir } from 'os';
-import { fleetAgents, type FleetAgent } from './fleet.js';
+import { fleetAgents, fleetSelf, type FleetAgent } from './fleet.js';
 import { dirname, join } from 'path';
 import {
   Target, resolveTarget, targetExec, targetReadFile, targetTry, targetWriteFile,
@@ -711,15 +711,35 @@ export function listEmployees(targetSpec?: string, includeArchived = false): Emp
       }
     }
   }
-  // Union the shared roster with this host's local records. Local wins on slug
-  // collision: it carries runtime state (threadId, live status) the declaration
-  // deliberately does not, and dropping that would break session resumption.
+  // Union the shared roster with this host's local records.
+  //
+  // A local record only overrides a declaration when THIS host is the declared
+  // home. Then the two describe the same agent and the local copy adds runtime
+  // state (threadId, live status) that the declaration deliberately omits, so
+  // dropping it would break session resumption.
+  //
+  // When the declaration is homed elsewhere, the local record is a stale copy
+  // left over from before the roster -- or worse, an unrelated agent that merely
+  // shares a name. Letting it win means a laptop's own "Henry" shadows the real
+  // Henry on the Mini and dispatch silently goes to the wrong place. Observed:
+  // doge1-2 shadowing Henry/Iris/Nora, and the Mini shadowing letta's Mike.
+  const homeId = (() => { try { return fleetSelf()?.id ?? null; } catch { return null; } })();
   const bySlug = new Map<string, EmployeeManifest>();
   for (const m of fleetEmployeeManifests()) if (m.slug) bySlug.set(m.slug, m);
   for (const m of manifests) {
     if (!m.slug) continue;
-    const declared = bySlug.get(m.slug);
-    bySlug.set(m.slug, declared ? { ...declared, ...m } : m);
+    const declared = bySlug.get(m.slug) as (EmployeeManifest & { target?: string }) | undefined;
+    if (!declared) {
+      // No declaration anywhere: an agent only this machine knows about.
+      bySlug.set(m.slug, { ...m, source: 'local-only' } as unknown as EmployeeManifest);
+      continue;
+    }
+    if (homeId && declared.target === homeId) {
+      bySlug.set(m.slug, { ...declared, ...m, source: 'fleet+local' } as unknown as EmployeeManifest);
+    } else {
+      // Keep the declaration authoritative; record that a shadowing copy exists.
+      bySlug.set(m.slug, { ...declared, shadowedByLocalCopy: true } as unknown as EmployeeManifest);
+    }
   }
   return [...bySlug.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
