@@ -7,6 +7,7 @@ import { execFileSync, spawn, spawnSync } from 'child_process';
 import { readFileSync, existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { fleetHosts, resolveFleetHost } from './fleet.js';
 
 export interface Target {
   name: string;
@@ -34,11 +35,28 @@ export function resolveTarget(spec?: string): Target {
     }
   } catch { /* ignore malformed config */ }
   if (presets[spec]) return presets[spec];
+
+  // The fleet roster is consulted BEFORE user@host and before failing. It is the
+  // only source that knows which host is *this* one, so it is also the only way
+  // to stop a correct name like "mini" resolving to an SSH hop back to
+  // ourselves. Falls through silently when the roster is absent.
+  try {
+    const hit = resolveFleetHost(spec);
+    if (hit) {
+      if (hit.isSelf || !hit.sshHost) return BUILTIN.local;
+      return { name: hit.host.id, type: 'ssh', host: hit.sshHost, workRoot: '~/dev' };
+    }
+  } catch { /* a broken roster must not break dispatch */ }
+
   if (spec.includes('@')) {
     return { name: spec, type: 'ssh', host: spec, workRoot: '~/dev' };
   }
-  // unknown preset name -> fall back to local with a warning marker
-  throw new Error(`unknown target "${spec}" (not in targets.json and not user@host)`);
+  const known = (() => {
+    try { return fleetHosts().map((h) => h.id).sort().join(', '); } catch { return ''; }
+  })();
+  throw new Error(
+    `unknown target "${spec}" (not in targets.json, not a fleet host, not user@host)`
+    + (known ? `. Fleet hosts: ${known}` : ''));
 }
 
 const SSH_CONTROL_DIR = join(homedir(), '.gpt5mcp', 'ssh-control');
