@@ -2,6 +2,7 @@ import {
   existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'fs';
 import { homedir } from 'os';
+import { fleetAgents, type FleetAgent } from './fleet.js';
 import { dirname, join } from 'path';
 import {
   Target, resolveTarget, targetExec, targetReadFile, targetTry, targetWriteFile,
@@ -653,6 +654,36 @@ export function fireEmployee(name: string, targetSpec?: string, purge = false): 
   return { name: manifest.name, target: target.name, status: 'archived', archivePath };
 }
 
+/** Fleet declarations rendered in EmployeeManifest shape.
+ *
+ *  These come from the git-distributed roster, so a laptop that has never hired
+ *  anyone still sees every agent that exists -- which is the whole point: the
+ *  duplicate hires happened because the answer to "does this already exist?" was
+ *  computed from a registry only the hiring machine could see.
+ */
+function fleetEmployeeManifests(): EmployeeManifest[] {
+  try {
+    return fleetAgents().map((a: FleetAgent) => ({
+      schemaVersion: 1,
+      name: a.name,
+      slug: a.slug,
+      target: a.homeHost,
+      workspace: a.workspace,
+      rolePack: a.rolePack,
+      skills: [],
+      plugins: [],
+      charter: a.charter,
+      model: a.model,
+      status: 'active',
+      source: 'fleet',
+      lifecycle: a.lifecycle,
+      bridge: a.transport?.port
+        ? { port: a.transport.port, botUsername: a.transport.bot }
+        : undefined,
+    } as unknown as EmployeeManifest));
+  } catch { return []; }
+}
+
 export function listEmployees(targetSpec?: string, includeArchived = false): EmployeeManifest[] {
   const target = resolveTarget(targetSpec);
   const roots = [`${teamRoot(target)}/employees`];
@@ -680,7 +711,17 @@ export function listEmployees(targetSpec?: string, includeArchived = false): Emp
       }
     }
   }
-  return manifests.sort((a, b) => a.name.localeCompare(b.name));
+  // Union the shared roster with this host's local records. Local wins on slug
+  // collision: it carries runtime state (threadId, live status) the declaration
+  // deliberately does not, and dropping that would break session resumption.
+  const bySlug = new Map<string, EmployeeManifest>();
+  for (const m of fleetEmployeeManifests()) if (m.slug) bySlug.set(m.slug, m);
+  for (const m of manifests) {
+    if (!m.slug) continue;
+    const declared = bySlug.get(m.slug);
+    bySlug.set(m.slug, declared ? { ...declared, ...m } : m);
+  }
+  return [...bySlug.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export function getEmployee(name: string, targetSpec?: string): EmployeeManifest & {
