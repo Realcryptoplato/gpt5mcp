@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc && node -e \"require('fs').copyFileSync('src/driver.cjs','build/driver.cjs');require('fs').chmodSync('build/index.js','755')\"",
     "start": "node build/index.js",
-    "dev": "tsc && node build/index.js"
+    "dev": "tsc && node build/index.js",
+    "test": "tsc && node --test build/__tests__/*.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
