@@ -32,6 +32,17 @@ target such as `mini`, or an existing Telegram-backed Codex session.
   employee—to synthesize its learned workflow into a quarantined candidate
   skill for review. It never auto-promotes generated knowledge.
 
+If a target has an optional `~/.gpt5mcp/team/pools.json` describing which
+credit pool backs each employee, `team_manifest` returns a `pools` health
+summary (`green`/`yellow`/`red`/`unknown` counts) and a `directory` mapping
+each employee to its runtime, model, credit pool, and fallback employees;
+`team_list` annotates each employee the same way. `team_dispatch` refuses to
+dispatch to an employee whose pool is `red` (naming the pool, its note, and
+the fallback) unless `force=true` is passed; a `yellow` pool dispatches
+normally but the response includes a `poolWarning`. The file is entirely
+optional — everything above behaves exactly as before when it is absent or
+malformed.
+
 Employees are target-scoped and have an explicit absolute workspace. Role packs
 resolve only skills listed in the library's approved registry; revoked and
 quarantined skills fail closed.

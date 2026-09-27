@@ -193,6 +193,7 @@ const TeamDispatchSchema = z.object({
   label: z.string().optional(),
   sync_library: z.boolean().optional().default(true),
   extra_skills: z.array(z.string()).optional().default([]).describe("Additional approved skills for this one assignment"),
+  force: z.boolean().optional().default(false).describe("Override a RED credit-pool gate (see team_manifest.directory/pools) and dispatch anyway"),
 });
 
 const TeamJobSchema = z.object({
@@ -244,11 +245,11 @@ type TeamPluginSyncArgs = z.infer<typeof TeamPluginSyncSchema>;
 
 const SERVER_INSTRUCTIONS = `This server dispatches Codex workers and manages durable named team employees on local or remote targets.
 
-For team work, START by calling team_manifest for the intended target (usually local or mini). It returns the live employees, approved role packs, skills, plugins, defaults, and workflow. Then call team_list and reuse a suitable employee when possible.
+For team work, START by calling team_manifest for the intended target (usually local or mini). It returns the live employees, approved role packs, skills, plugins, defaults, workflow, and — when the target has a pools.json — a pools health summary and a directory mapping each member to its runtime, model, and credit pool. Then call team_list and reuse a suitable employee when possible.
 
 To create an employee, call team_hire with a stable name, target, absolute workspace, and role_pack. If the checkout does not exist, also pass repo=owner/name and optional branch; the server clones it on that target. Extra skills must be approved ids returned by team_manifest. Run team_plugin_sync when a role requires plugins.
 
-Call team_dispatch for work, then team_status and team_result. Repeated assignments resume the employee's durable session and memory. Omit model/reasoning to use employee defaults; per-job overrides do not change those defaults. Telegram-bound employees run through their bridge so results can appear in both MCP and Telegram.
+Call team_dispatch for work, then team_status and team_result. Repeated assignments resume the employee's durable session and memory. Omit model/reasoning to use employee defaults; per-job overrides do not change those defaults. Telegram-bound employees run through their bridge so results can appear in both MCP and Telegram. Check directory/pools before dispatching: a member whose pool is RED refuses the dispatch (pass force=true to override); a YELLOW pool dispatches but returns a poolWarning. Prefer that member's listed fallback instead.
 
 Use team_skill_harvest to extract reusable knowledge; candidates remain quarantined until audited. team_fire archives by default. Read usage://team-onboarding for the complete playbook, or use the team-hire-employee MCP prompt.`;
 
@@ -259,7 +260,7 @@ This is the canonical fresh-client workflow for creating and operating durable C
 ## 1. Discover before changing anything
 
 1. Call \`team_manifest\` with the intended \`target\` (normally \`local\` or \`mini\`).
-2. Review its live \`employees\`, \`rolePacks\`, \`approvedSkills\`, \`approvedPlugins\`, and defaults.
+2. Review its live \`employees\`, \`rolePacks\`, \`approvedSkills\`, \`approvedPlugins\`, defaults, and — when present — \`pools\` (health summary) and \`directory\` (each member's runtime, model, and credit pool).
 3. Call \`team_list\` and reuse an existing employee when its workspace and role fit.
 
 Do not guess skill ids, plugin ids, role packs, remote paths, or employee names. The
@@ -316,6 +317,13 @@ override does not mutate the employee's defaults.
 Telegram-bound employees (such as Jack, Henry, or Sophia when configured) queue
 through their authenticated loopback bridge. The bridge runs the durable session
 once and can publish the result to both the MCP ledger and Telegram.
+
+When the target has a \`pools.json\`, \`team_manifest.directory\`/\`pools\` and each
+\`team_list\` entry show the employee's credit pool and its status. A RED pool
+makes \`team_dispatch\` throw naming the pool, its note, and the listed fallback
+employee(s); pass \`force=true\` to dispatch anyway. A YELLOW pool dispatches
+normally and returns a \`poolWarning\` with the same guidance. Prefer the fallback
+over forcing a RED pool.
 
 ## 6. Improve or retire
 
@@ -723,7 +731,7 @@ First call team_manifest(target=${target}) and team_list(target=${target}). Reus
           },
           {
             name: "team_manifest",
-            description: "START HERE for managed team work. Returns the selected target's live employees, role packs, approved skills/plugins, defaults, capability-library commit, and recommended workflow so a fresh agent does not have to guess.",
+            description: "START HERE for managed team work. Returns the selected target's live employees, role packs, approved skills/plugins, defaults, capability-library commit, recommended workflow, and (when pools.json exists) a pools health summary and a directory of each member's runtime/model/credit pool so callers can steer away from members whose pool is red.",
             inputSchema: zodToJsonSchema(TeamManifestSchema),
           },
           {
@@ -738,7 +746,7 @@ First call team_manifest(target=${target}) and team_list(target=${target}). Reus
           },
           {
             name: "team_list",
-            description: "List managed employees on a dispatch target, including their role, workspace, bridge binding, and current durable thread id.",
+            description: "List managed employees on a dispatch target, including their role, workspace, bridge binding, current durable thread id, and (when known from pools.json) their runtime, model, best-for note, credit pool, pool status, and fallback employees.",
             inputSchema: zodToJsonSchema(TeamListSchema),
           },
           {
@@ -753,7 +761,7 @@ First call team_manifest(target=${target}) and team_list(target=${target}). Reus
           },
           {
             name: "team_dispatch",
-            description: "Dispatch work to a named employee. Ordinary employees resume one durable Codex thread with explicit skill input items; Telegram-bound employees queue through their bridge so the same session runs once and the result is visible both here and in Telegram.",
+            description: "Dispatch work to a named employee. Ordinary employees resume one durable Codex thread with explicit skill input items; Telegram-bound employees queue through their bridge so the same session runs once and the result is visible both here and in Telegram. Refuses when the employee's credit pool (see team_manifest) is RED unless force=true; a YELLOW pool dispatches normally but returns a poolWarning.",
             inputSchema: zodToJsonSchema(TeamDispatchSchema),
           },
           {
@@ -1082,6 +1090,7 @@ First call team_manifest(target=${target}) and team_list(target=${target}). Reus
               label: args.label,
               syncLibrary: args.sync_library,
               extraSkills: args.extra_skills,
+              force: args.force,
             });
             return {
               content: [{
@@ -1098,6 +1107,7 @@ First call team_manifest(target=${target}) and team_list(target=${target}). Reus
                   model: result.job.model,
                   reasoningEffort: result.job.reasoningEffort,
                   libraryCommit: result.job.libraryCommit,
+                  poolWarning: result.poolWarning,
                   note: result.job.kind === "bridge"
                     ? "Queued through the employee's Telegram bridge. Poll team_status; the final result is also delivered to Telegram."
                     : "Dispatched to the employee's durable Codex thread. Poll team_status and collect with team_result.",

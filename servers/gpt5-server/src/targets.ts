@@ -4,7 +4,7 @@
 // remote job dir over SSH to poll, steer, and collect.
 
 import { execFileSync, spawn, spawnSync } from 'child_process';
-import { readFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { fleetHosts, resolveFleetHost } from './fleet.js';
@@ -119,6 +119,21 @@ export function targetExec(
 export function targetTry(t: Target, cmd: string, timeoutMs = 20000): { ok: boolean; out: string } {
   try { return { ok: true, out: targetExec(t, cmd, timeoutMs) }; }
   catch (e: any) { return { ok: false, out: (e && (e.stdout || e.message)) || String(e) }; }
+}
+
+/** Check whether a file (or directory, with kind='dir') exists on the target. */
+export function targetPathExists(t: Target, path: string, kind: 'file' | 'dir' = 'file'): boolean {
+  if (t.type === 'local') {
+    try {
+      const stat = statSync(path);
+      return kind === 'dir' ? stat.isDirectory() : stat.isFile();
+    } catch {
+      return false;
+    }
+  }
+  const flag = kind === 'dir' ? '-d' : '-f';
+  const p = path.replace(/'/g, `'\\''`);
+  return targetExec(t, `if test ${flag} '${p}'; then printf yes; else printf no; fi`).trim() === 'yes';
 }
 
 /** Read a file from the target ('' if missing). */

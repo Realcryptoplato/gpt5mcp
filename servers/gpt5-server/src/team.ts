@@ -1,16 +1,19 @@
 import {
-  existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
+  existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync,
 } from 'fs';
 import { homedir } from 'os';
 import { fleetAgents, fleetSelf, type FleetAgent } from './fleet.js';
 import { dirname, join } from 'path';
 import {
-  Target, resolveTarget, targetExec, targetReadFile, targetTry, targetWriteFile,
+  Target, resolveTarget, targetExec, targetPathExists, targetReadFile, targetTry, targetWriteFile,
 } from './targets.js';
 import {
   SessMeta, StartOpts, getSession, sessionEvents, sessionFinalMessage,
   sessionChangedFiles, startSession,
 } from './codexSession.js';
+import {
+  annotateEmployeeWithPool, buildDirectory, buildPoolsSummary, evaluatePoolGate, readPoolsFile,
+} from './pools.js';
 
 const LIBRARY_REPO = process.env.GPT5_CAPABILITY_REPO || 'Realcryptoplato/team-agent-capabilities';
 const LOCAL_LIBRARY_OVERRIDE = process.env.GPT5_CAPABILITY_LIBRARY;
@@ -53,6 +56,13 @@ export interface EmployeeManifest {
   updatedAt: string;
   threadId?: string;
   bridge?: BridgeBinding;
+  // Populated from pools.json when the employee's slug appears there; absent otherwise.
+  pool?: string;
+  poolStatus?: 'green' | 'yellow' | 'red' | 'unknown';
+  poolNote?: string;
+  fallback?: string[];
+  runtime?: string;
+  bestFor?: string;
 }
 
 export interface SkillRef {
@@ -105,6 +115,7 @@ export interface TeamDispatchArgs {
   label?: string;
   syncLibrary?: boolean;
   extraSkills?: string[];
+  force?: boolean;
 }
 
 export interface TeamCapabilityManifest {
@@ -140,6 +151,8 @@ export interface TeamCapabilityManifest {
     reason?: string;
   }>;
   employees: EmployeeManifest[];
+  pools: ReturnType<typeof buildPoolsSummary>;
+  directory: ReturnType<typeof buildDirectory>;
 }
 
 interface ApprovedSkill {
@@ -251,22 +264,6 @@ function jsonOnTarget<T>(target: Target, path: string): T {
 
 function writeJsonOnTarget(target: Target, path: string, value: unknown): void {
   targetWriteFile(target, path, `${JSON.stringify(value, null, 2)}\n`);
-}
-
-function targetPathExists(target: Target, path: string, kind: 'file' | 'dir' = 'file'): boolean {
-  if (target.type === 'local') {
-    try {
-      const stat = statSync(path);
-      return kind === 'dir' ? stat.isDirectory() : stat.isFile();
-    } catch {
-      return false;
-    }
-  }
-  const flag = kind === 'dir' ? '-d' : '-f';
-  return targetExec(
-    target,
-    `if test ${flag} ${shellQuote(path)}; then printf yes; else printf no; fi`,
-  ).trim() === 'yes';
 }
 
 export function syncCapabilityLibrary(targetSpec?: string, ref = 'main', force = false): {
@@ -521,6 +518,9 @@ print(json.dumps({
 export function getTeamCapabilityManifest(targetSpec?: string): TeamCapabilityManifest {
   const target = resolveTarget(targetSpec);
   const library = syncCapabilityLibrary(targetSpec);
+  const poolsFile = readPoolsFile(target, teamRoot(target));
+  const pools = buildPoolsSummary(poolsFile);
+  const directory = buildDirectory(poolsFile);
   if (target.type === 'ssh') {
     const snapshot = remoteCapabilitySnapshot(target, library.path);
     return {
@@ -540,6 +540,7 @@ export function getTeamCapabilityManifest(targetSpec?: string): TeamCapabilityMa
         'Poll team_status and collect team_result. Repeated dispatches resume the same durable employee thread.',
         'Use team_skill_harvest to propose reusable learned workflow; harvested skills remain quarantined until audited.',
         'Use team_update for durable changes. team_fire archives recoverably unless purge=true is explicitly requested.',
+        'Check directory/pools: avoid members whose pool is red; prefer the listed fallback.',
       ],
       rolePacks: snapshot.roles.map(({ pack, template }) => ({
         id: pack.id,
@@ -561,7 +562,11 @@ export function getTeamCapabilityManifest(targetSpec?: string): TeamCapabilityMa
       approvedPlugins: snapshot.plugins.plugins
         .filter((plugin) => plugin.status === 'approved')
         .map(({ id, source, reason }) => ({ id, source, reason })),
-      employees: snapshot.employees.sort((a, b) => a.name.localeCompare(b.name)),
+      employees: snapshot.employees
+        .map((employee) => annotateEmployeeWithPool(employee, poolsFile))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+      pools,
+      directory,
     };
   }
   const approved = jsonOnTarget<{ skills: ApprovedSkill[] }>(
@@ -613,6 +618,7 @@ export function getTeamCapabilityManifest(targetSpec?: string): TeamCapabilityMa
       'Poll team_status and collect team_result. Repeated dispatches resume the same durable employee thread.',
       'Use team_skill_harvest to propose reusable learned workflow; harvested skills remain quarantined until audited.',
       'Use team_update for durable changes. team_fire archives recoverably unless purge=true is explicitly requested.',
+      'Check directory/pools: avoid members whose pool is red; prefer the listed fallback.',
     ],
     rolePacks,
     approvedSkills: approved.skills.map((skill) => {
@@ -628,6 +634,8 @@ export function getTeamCapabilityManifest(targetSpec?: string): TeamCapabilityMa
       .filter((plugin) => plugin.status === 'approved')
       .map(({ id, source, reason }) => ({ id, source, reason })),
     employees: listEmployees(targetSpec, false),
+    pools,
+    directory,
   };
 }
 
@@ -741,7 +749,10 @@ export function listEmployees(targetSpec?: string, includeArchived = false): Emp
       bySlug.set(m.slug, { ...declared, shadowedByLocalCopy: true } as unknown as EmployeeManifest);
     }
   }
-  return [...bySlug.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const poolsFile = readPoolsFile(target, teamRoot(target));
+  return [...bySlug.values()]
+    .map((m) => annotateEmployeeWithPool(m, poolsFile))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export function getEmployee(name: string, targetSpec?: string): EmployeeManifest & {
@@ -1076,9 +1087,13 @@ export function dispatchEmployee(args: TeamDispatchArgs): {
   job: TeamJob;
   session?: SessMeta;
   plugins: string[];
+  poolWarning?: string;
 } {
   const target = resolveTarget(args.target);
   const manifest = readEmployee(target, args.employee);
+  const poolsFile = readPoolsFile(target, teamRoot(target));
+  const gate = evaluatePoolGate(poolsFile, manifest.name, manifest.slug, args.force === true);
+  if (gate.blocked) throw new Error(gate.blocked);
   const library = args.syncLibrary === false
     ? {
         target: target.name,
@@ -1111,6 +1126,7 @@ export function dispatchEmployee(args: TeamDispatchArgs): {
         args.label,
       ),
       plugins: capabilities.plugins,
+      poolWarning: gate.warning,
     };
   }
 
@@ -1143,7 +1159,7 @@ export function dispatchEmployee(args: TeamDispatchArgs): {
     reasoningEffort,
   };
   writeTeamJob(job);
-  return { job, session, plugins: capabilities.plugins };
+  return { job, session, plugins: capabilities.plugins, poolWarning: gate.warning };
 }
 
 function persistEmployeeThread(job: TeamJob, threadId?: string): void {
