@@ -22,7 +22,7 @@ import {
   sessionEvents, sessionFinalMessage, sessionChangedFiles,
 } from './codexSession.js';
 import {
-  dispatchEmployee, fireEmployee, getEmployee, harvestEmployeeKnowledge, hireEmployee,
+  cancelTeamJob, dispatchEmployee, fireEmployee, getEmployee, harvestEmployeeKnowledge, hireEmployee,
   getTeamCapabilityManifest, listEmployees, syncCapabilityLibrary, syncEmployeePlugins,
   teamJobResult, teamJobStatus, updateEmployee,
 } from './team.js';
@@ -214,6 +214,13 @@ const TeamLibrarySyncSchema = z.object({
   ref: z.string().optional().default("main").describe("Exact branch, tag, or ref to sync"),
 });
 
+const TeamCancelSchema = z.object({
+  job_id: z.string().min(8).describe("Team/bridge job id to cancel, for example tb_... (the team job id equals the bridge job id)"),
+  employee: z.string().optional().describe("Employee that owns the job. Omit to resolve it from the local team job record; if that lookup fails, this is required."),
+  target: z.string().optional().default("local").describe("Dispatch target the employee is homed on. Only consulted when employee is supplied."),
+  reason: z.string().max(200).optional().describe("Optional human-readable cancellation reason (<=200 chars), forwarded to the bridge"),
+});
+
 const TeamPluginSyncSchema = z.object({
   employee: z.string().min(1),
   target: z.string().optional().default("local"),
@@ -239,6 +246,7 @@ type TeamListArgs = z.infer<typeof TeamListSchema>;
 type TeamFireArgs = z.infer<typeof TeamFireSchema>;
 type TeamDispatchToolArgs = z.infer<typeof TeamDispatchSchema>;
 type TeamJobArgs = z.infer<typeof TeamJobSchema>;
+type TeamCancelToolArgs = z.infer<typeof TeamCancelSchema>;
 type TeamHarvestArgs = z.infer<typeof TeamHarvestSchema>;
 type TeamLibrarySyncArgs = z.infer<typeof TeamLibrarySyncSchema>;
 type TeamPluginSyncArgs = z.infer<typeof TeamPluginSyncSchema>;
@@ -251,7 +259,7 @@ To create an employee, call team_hire with a stable name, target, absolute works
 
 Call team_dispatch for work, then team_status and team_result. Repeated assignments resume the employee's durable session and memory. Omit model/reasoning to use employee defaults; per-job overrides do not change those defaults. Telegram-bound employees run through their bridge so results can appear in both MCP and Telegram. Check directory/pools before dispatching: a member whose pool is RED refuses the dispatch (pass force=true to override); a YELLOW pool dispatches but returns a poolWarning. Prefer that member's listed fallback instead.
 
-Use team_skill_harvest to extract reusable knowledge; candidates remain quarantined until audited. team_fire archives by default. Read usage://team-onboarding for the complete playbook, or use the team-hire-employee MCP prompt.`;
+Use team_skill_harvest to extract reusable knowledge; candidates remain quarantined until audited. team_fire archives by default. To re-route work, call team_cancel on a still-QUEUED bridge job before re-dispatching it to a different employee — it never touches running work (409 if the job already started or finished). Read usage://team-onboarding for the complete playbook, or use the team-hire-employee MCP prompt.`;
 
 const TEAM_ONBOARDING = `# Managed team onboarding
 
@@ -325,8 +333,13 @@ employee(s); pass \`force=true\` to dispatch anyway. A YELLOW pool dispatches
 normally and returns a \`poolWarning\` with the same guidance. Prefer the fallback
 over forcing a RED pool.
 
-## 6. Improve or retire
+## 6. Re-route or improve or retire
 
+- \`team_cancel\` cancels a still-QUEUED bridge job (never a running one), for
+  example to re-route work to a different employee. Omit \`employee\` to
+  resolve it from the local team job record. A 409 means the job already
+  started or finished. For a direct (non-bridge) employee, use
+  \`codex_interrupt\` instead.
 - \`team_update\` changes durable configuration.
 - \`team_skill_harvest\` asks the employee's existing session to synthesize a candidate skill. Candidates are quarantined until audit and promotion.
 - \`team_fire\` archives recoverably by default; \`purge=true\` is permanent and should be explicit.
@@ -455,6 +468,11 @@ inputs; quarantined or revoked skills are rejected.
   employees queue through their loopback-only authenticated bridge and can
   return the result to both the MCP job ledger and Telegram.
 - **team_status** / **team_result** inspect and collect direct or bridge jobs.
+- **team_cancel** cancels a still-QUEUED bridge job (never a running one) so the
+  work can be re-routed to a different employee. Resolves the employee's
+  bridge port from its manifest; if employee is omitted it is looked up from
+  the local team job record. 409 means the job already started or finished;
+  for a direct (non-bridge) employee, use codex_interrupt instead.
 - **team_library_sync** installs or updates the private versioned capability
   library on local or remote targets.
 - **team_plugin_sync** checks an employee's approved plugin requirements and
@@ -773,6 +791,11 @@ First call team_manifest(target=${target}) and team_list(target=${target}). Reus
             name: "team_result",
             description: "Collect the result of a team job, including employee, skill receipt metadata, thread id, changed files, and final message.",
             inputSchema: zodToJsonSchema(TeamJobSchema),
+          },
+          {
+            name: "team_cancel",
+            description: "Cancel a still-QUEUED job on a Telegram-bridge employee so the work can be re-routed to a different employee. Never touches running work: the bridge returns 409 if the job already started or finished. Resolves the employee's bridge port from its manifest; if employee is omitted, it is looked up from the local team job record. For a direct (non-bridge, codex_dispatch) employee, use codex_interrupt instead.",
+            inputSchema: zodToJsonSchema(TeamCancelSchema),
           },
           {
             name: "team_skill_harvest",
@@ -1133,6 +1156,17 @@ First call team_manifest(target=${target}) and team_list(target=${target}). Reus
               content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
               ...(result.state === "failed" ? { isError: true } : {}),
             };
+          }
+
+          case "team_cancel": {
+            const args = TeamCancelSchema.parse(request.params.arguments) as TeamCancelToolArgs;
+            const result = cancelTeamJob({
+              jobId: args.job_id,
+              employee: args.employee,
+              target: args.target,
+              reason: args.reason,
+            });
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
           }
 
           case "team_skill_harvest": {
