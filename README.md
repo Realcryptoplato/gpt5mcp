@@ -24,6 +24,11 @@ target such as `mini`, or an existing Telegram-backed Codex session.
   default; permanent deletion requires `purge=true`.
 - `team_dispatch`, `team_status`, and `team_result` resume the employee's Codex
   thread and attach approved skills as native app-server skill inputs.
+- `team_cancel` cancels a still-QUEUED job on a Telegram-bridge employee, for
+  example to re-route work to a different employee. It never touches running
+  work — the bridge returns 409 if the job already started or finished. If
+  `employee` is omitted it is resolved from the local team job record; for a
+  direct (non-bridge) employee, use `codex_interrupt` instead.
 - `team_library_sync` installs or updates the private, versioned capability
   library on a target.
 - `team_plugin_sync` verifies an employee's approved plugin requirements and

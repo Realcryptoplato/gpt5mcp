@@ -1162,6 +1162,133 @@ export function dispatchEmployee(args: TeamDispatchArgs): {
   return { job, session, plugins: capabilities.plugins, poolWarning: gate.warning };
 }
 
+// --- team_cancel: cancel a QUEUED bridge job (never touches running work) ---
+
+const CANCEL_JOB_ID_PATTERN = /^[A-Za-z0-9_-]{8,128}$/;
+
+export interface TeamCancelArgs {
+  jobId: string;
+  employee?: string;
+  target?: string;
+  reason?: string;
+}
+
+export interface CancelExecDeps {
+  exec: (target: Target, cmd: string, timeoutMs?: number) => string;
+}
+
+const DEFAULT_CANCEL_DEPS: CancelExecDeps = { exec: targetExec };
+
+/** Reject anything that is not a plain team/bridge job id before it reaches a command line. */
+export function validateCancelJobId(jobId: string): void {
+  if (!CANCEL_JOB_ID_PATTERN.test(jobId)) {
+    throw new Error(`invalid job_id ${JSON.stringify(jobId)}: must match ${CANCEL_JOB_ID_PATTERN}`);
+  }
+}
+
+/** Pure URL builder: reason is percent-encoded, never interpolated raw. */
+export function buildBridgeCancelUrl(port: number, jobId: string, reason?: string): string {
+  const base = `http://127.0.0.1:${port}/dispatch/${jobId}/cancel`;
+  return reason ? `${base}?reason=${encodeURIComponent(reason)}` : base;
+}
+
+/**
+ * Build the exact command run on the target. The url and token path are embedded
+ * via JSON.stringify (a valid Python string literal), and the whole script is then
+ * shell-quoted as one argument — so a hostile reason (quotes, $(...), newlines) can
+ * only ever land as inert data inside a Python string, never as shell syntax.
+ */
+export function buildCancelCommand(url: string, tokenPath: string): string {
+  const python = `
+import json, pathlib, urllib.request, urllib.error
+token = pathlib.Path(${JSON.stringify(tokenPath)}).read_text().strip()
+req = urllib.request.Request(${JSON.stringify(url)}, method="POST", headers={"X-Dispatch-Token": token})
+try:
+    body = urllib.request.urlopen(req, timeout=15).read().decode()
+    print(json.dumps({"ok": True, "status": 200, "body": body}))
+except urllib.error.HTTPError as e:
+    print(json.dumps({"ok": False, "status": e.code, "body": e.read().decode()}))
+`.trim();
+  return `python3 -c ${shellQuote(python)}`;
+}
+
+/** Map the bridge's cancel status codes to a caller-facing explanation. */
+export function mapCancelBridgeError(status: number, jobId: string, body: string): string {
+  const detail = body ? ` (bridge: ${body.slice(0, 200)})` : '';
+  switch (status) {
+    case 409:
+      return `job ${jobId} is running or already finished; only queued jobs can be cancelled${detail}`;
+    case 404:
+      return `unknown job ${jobId} on bridge${detail}`;
+    case 401:
+      return `bridge rejected the dispatch token (401 unauthorized)${detail}`;
+    default:
+      return `bridge cancel failed with status ${status}${detail}`;
+  }
+}
+
+/**
+ * Cancel a QUEUED job on a Telegram-bridge employee. Mirrors dispatchBridge's
+ * request shape exactly (same token file, same loopback host:port, same
+ * X-Dispatch-Token header) but hits /dispatch/{job_id}/cancel instead.
+ */
+export function cancelTeamJob(args: TeamCancelArgs, deps: CancelExecDeps = DEFAULT_CANCEL_DEPS): {
+  job_id: string;
+  state: string;
+  previous_state?: string;
+  effect?: string;
+  employee: string;
+  target: string;
+} {
+  validateCancelJobId(args.jobId);
+
+  let target: Target;
+  let manifest: EmployeeManifest;
+  if (args.employee) {
+    target = resolveTarget(args.target);
+    manifest = readEmployee(target, args.employee);
+  } else {
+    const job = readTeamJob(args.jobId);
+    if (!job) {
+      throw new Error(
+        `no local record of team job ${args.jobId}; pass employee to identify which bridge to cancel on`,
+      );
+    }
+    target = resolveTarget(job.target);
+    manifest = readEmployee(target, job.employeeSlug);
+  }
+
+  if (!manifest.bridge) {
+    throw new Error(
+      `${manifest.name} has no Telegram bridge (a direct Codex employee); `
+      + `use codex_interrupt for codex_dispatch jobs instead of team_cancel`,
+    );
+  }
+
+  const tokenPath = `${targetHome(target)}/.gpt5mcp/bridge-token`;
+  const url = buildBridgeCancelUrl(manifest.bridge.port, args.jobId, args.reason);
+  const command = buildCancelCommand(url, tokenPath);
+  const response = deps.exec(target, command, 30000);
+
+  let envelope: { ok: boolean; status: number; body: string };
+  try {
+    envelope = JSON.parse(response);
+  } catch {
+    throw new Error(`bridge cancel returned an unparsable response: ${response.slice(0, 300)}`);
+  }
+  if (!envelope.ok) {
+    throw new Error(mapCancelBridgeError(envelope.status, args.jobId, envelope.body));
+  }
+
+  let result: any;
+  try {
+    result = JSON.parse(envelope.body);
+  } catch {
+    throw new Error(`bridge returned a non-JSON success body: ${envelope.body.slice(0, 300)}`);
+  }
+  return { ...result, employee: manifest.name, target: manifest.target };
+}
+
 function persistEmployeeThread(job: TeamJob, threadId?: string): void {
   if (!threadId) return;
   const target = resolveTarget(job.target);
