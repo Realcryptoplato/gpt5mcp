@@ -1,3 +1,4 @@
+import { normalizeModel } from './utils.js';
 // Steerable Codex jobs via the app-server protocol (thread/start -> turn/start
 // -> turn/steer / turn/interrupt), runnable LOCALLY or on a REMOTE host (e.g. the
 // Mac Mini over Tailscale).
@@ -224,7 +225,7 @@ export function startSession(opts: StartOpts): SessMeta {
   // omitted, `model` stays undefined and driver.cjs skips --model entirely,
   // letting codex app-server use its own configured default instead of a
   // version pinned into this file at build time.
-  const model = opts.model;
+  const model = normalizeModel(opts.model);
   const branch = opts.branch || 'main';
   const startedAt = new Date().toISOString();
 

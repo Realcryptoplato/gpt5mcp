@@ -143,7 +143,7 @@ const TeamHireSchema = z.object({
   skills: z.array(z.string()).optional().default([]).describe("Additional approved skill ids"),
   plugins: z.array(z.string()).optional().default([]).describe("Additional plugin ids recorded as requirements"),
   charter: z.string().optional().describe("Employee-specific role and boundaries"),
-  model: z.string().optional().describe("Employee default Codex model, for example gpt-5.6-sol"),
+  model: z.string().optional().describe("Employee default Codex model, for example gpt-6.1-sol (gpt-5.x is auto-upgraded)"),
   reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional().describe("Employee default reasoning effort"),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
   bridge_port: z.number().int().min(1).max(65535).optional().describe("Existing Telegram bridge port. When set, team_dispatch queues into that bridge's durable session."),
@@ -363,15 +363,10 @@ async function fetchAvailableModels(): Promise<{
   // Fallback: proxy unreachable, return known OpenAI models + guidance
   return {
     proxied: false,
-    count: 7,
+    count: 2,
     models: [
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-      "gpt-5.5",
-      "gpt-5.4",
-      "gpt-5.4-mini",
-      "gpt-5.3-codex-spark",
+      "gpt-6.1-sol",
+      "gpt-6-sol",
     ],
     note: "Local OpenRouter proxy is offline. Only standard OpenAI/gpt- model names are supported. To use OpenRouter or third-party models, start the proxy or pass model=openrouter/... (dispatch will fail if the proxy can't route it). Full OpenRouter catalog: https://openrouter.ai/models",
   };

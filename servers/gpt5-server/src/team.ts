@@ -1,3 +1,4 @@
+import { normalizeModel } from './utils.js';
 import {
   existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'fs';
@@ -1089,7 +1090,7 @@ export function dispatchEmployee(args: TeamDispatchArgs): {
     : syncCapabilityLibrary(args.target);
   const capabilities = resolveEmployeeCapabilities(target, manifest, library.path, args.extraSkills);
   const prompt = employeePrompt(target, manifest, args.prompt, capabilities.skills);
-  const model = args.model || manifest.model;
+  const model = normalizeModel(args.model || manifest.model);
   const reasoningEffort = args.reasoningEffort || manifest.reasoningEffort;
 
   if (manifest.bridge) {
