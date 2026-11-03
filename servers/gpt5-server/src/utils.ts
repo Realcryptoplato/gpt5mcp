@@ -18,11 +18,12 @@ import { join } from 'path';
 
 /** Greg (2026-11-02): never run legacy gpt-5.x models. Any gpt-5* request is
  *  upgraded to the current default; undefined stays undefined (codex CLI
- *  default, ~/.codex/config.toml, currently gpt-6.1-sol). */
-export const CURRENT_DEFAULT_MODEL = 'gpt-6.1-sol';
+ *  default, ~/.codex/config.toml, currently gpt-6-sol). gpt-6.1-sol is rejected for ChatGPT-account Codex
+ *  (model_not_found, 2026-11-02), so it is also mapped to gpt-6-sol. */
+export const CURRENT_DEFAULT_MODEL = 'gpt-6-sol';
 export function normalizeModel(model?: string): string | undefined {
   if (!model) return model;
-  if (/^(openai\/)?gpt-5([.\-]|$)/i.test(model.trim())) {
+  if (/^(openai\/)?gpt-(5([.\-]|$)|6\.1)/i.test(model.trim())) {
     console.error(`normalizeModel: legacy model "${model}" upgraded to ${CURRENT_DEFAULT_MODEL}`);
     return CURRENT_DEFAULT_MODEL;
   }
