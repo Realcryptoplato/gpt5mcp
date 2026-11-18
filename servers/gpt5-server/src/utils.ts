@@ -16,16 +16,21 @@ import { mkdtempSync, readFileSync, rmSync, existsSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-/** Greg (2026-11-02): never run legacy gpt-5.x models. Any gpt-5* request is
- *  upgraded to the current default; undefined stays undefined (codex CLI
- *  default, ~/.codex/config.toml, currently gpt-6-sol). gpt-6.1-sol is rejected for ChatGPT-account Codex
- *  (model_not_found, 2026-11-02), so it is also mapped to gpt-6-sol. */
-export const CURRENT_DEFAULT_MODEL = 'gpt-6-sol';
+/** Greg (2026-11-18): gpt-6.2-sol is the default; never let a session silently
+ *  run a weaker/older model. Any older gpt-5.x / gpt-6 / gpt-6.1 sol/luna/terra
+ *  request is upgraded to gpt-6.2-sol; older astra requests go to gpt-6.2-astra.
+ *  gpt-6.2-astra is an explicit opt-in for very hard problems only.
+ *  Requires codex CLI >= 0.170 (older CLIs return model_not_found for 6.2).
+ *  undefined stays undefined (codex CLI default, ~/.codex/config.toml). */
+export const CURRENT_DEFAULT_MODEL = 'gpt-6.2-sol';
+export const HARD_PROBLEM_MODEL = 'gpt-6.2-astra';
 export function normalizeModel(model?: string): string | undefined {
   if (!model) return model;
-  if (/^(openai\/)?gpt-(5([.\-]|$)|6\.1)/i.test(model.trim())) {
-    console.error(`normalizeModel: legacy model "${model}" upgraded to ${CURRENT_DEFAULT_MODEL}`);
-    return CURRENT_DEFAULT_MODEL;
+  const m = model.trim().replace(/^openai\//i, '');
+  if (/^gpt-(5([.\-]|$)|6(\.[01])?(-|$))/i.test(m)) {
+    const target = /astra/i.test(m) ? HARD_PROBLEM_MODEL : CURRENT_DEFAULT_MODEL;
+    console.error(`normalizeModel: older model "${model}" upgraded to ${target}`);
+    return target;
   }
   return model;
 }
